@@ -136,6 +136,21 @@ async def ask_jev(jev: JevClient, state: dict) -> JevView:
     )
 
 
+def normal_cdf(z: float) -> float:
+    """Standard normal CDF without an external numerical dependency."""
+    return 0.5 * (1.0 + math.erf(z / math.sqrt(2.0)))
+
+
+def quantitative_up_probability(snapshot: ShortTermSnapshot) -> float | None:
+    """Zero-drift diffusion baseline: P(final > target) = Phi(distance_z)."""
+    features = snapshot.path_features
+    if features is None or not features.feature_ready or features.distance_z is None:
+        return None
+    p = normal_cdf(features.distance_z)
+    # Avoid exact 0/1 inputs to sizing while preserving the quantitative signal.
+    return min(0.999, max(0.001, p))
+
+
 def round_to_tick(price: float, tick: float) -> float:
     if tick <= 0:
         return round(price, 4)
@@ -154,17 +169,29 @@ def kelly_fraction(p: float, price: float) -> float:
     return max(0.0, f)
 
 
-def evaluate(view: JevView, book: Book, s: Settings, bankroll_usd: float | None = None) -> Trade | Skip:
+def evaluate(
+    view: JevView,
+    book: Book,
+    s: Settings,
+    bankroll_usd: float | None = None,
+    *,
+    probability_yes: float | None = None,
+    probability_source: str = "Jev",
+) -> Trade | Skip:
     if view.answerable < s.min_answerable:
         return Skip(f"信息充分度 {view.answerable:.2f} < 阈值 {s.min_answerable}")
     if view.clarity < s.min_clarity:
         return Skip(f"结算规则清晰度 {view.clarity} < 阈值 {s.min_clarity}")
 
+    p_yes = view.p_yes if probability_yes is None else probability_yes
+    if not 0.0 <= p_yes <= 1.0:
+        return Skip(f"{probability_source} 概率超出 [0,1]：{p_yes}")
+
     candidates: list[tuple[str, str, float, float]] = []  # outcome, token, p, ask
     if book.yes_ask is not None:
-        candidates.append((book.yes_label.upper(), book.yes_token_id, view.p_yes, book.yes_ask))
+        candidates.append((book.yes_label.upper(), book.yes_token_id, p_yes, book.yes_ask))
     if book.no_ask is not None:
-        candidates.append((book.no_label.upper(), book.no_token_id, 1 - view.p_yes, book.no_ask))
+        candidates.append((book.no_label.upper(), book.no_token_id, 1 - p_yes, book.no_ask))
     if not candidates:
         return Skip("两个方向都没有可成交卖价")
     in_band = [c for c in candidates if s.min_trade_price <= c[3] <= s.max_trade_price]
@@ -204,8 +231,8 @@ def evaluate(view: JevView, book: Book, s: Settings, bankroll_usd: float | None 
         p=p,
         edge=edge,
         rationale=(
-            f"Jev P({outcome})={p:.2f}，卖价={ask:.2f}，优势={edge:+.2f}；"
-            f"信息充分度={view.answerable:.2f}，规则清晰度={view.clarity}"
+            f"{probability_source} P({outcome})={p:.2f}，卖价={ask:.2f}，优势={edge:+.2f}；"
+            f"Jev信息充分度={view.answerable:.2f}，规则清晰度={view.clarity}"
         ),
     )
 
