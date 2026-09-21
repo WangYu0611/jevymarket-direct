@@ -423,6 +423,12 @@ class Store:
         ).fetchone()[0]
         n_results = c.execute("SELECT COUNT(*) FROM market_results").fetchone()[0]
         n_briefs = c.execute("SELECT COUNT(*) FROM research").fetchone()[0]
+        jev_cost = c.execute(
+            "SELECT COALESCE(SUM(jev_cost),0) FROM decisions"
+        ).fetchone()[0]
+        research_cost = c.execute(
+            "SELECT COALESCE(SUM(cost),0) FROM research"
+        ).fetchone()[0]
         usd = c.execute(
             """
             SELECT COALESCE(SUM(usd),0) FROM orders
@@ -444,6 +450,8 @@ class Store:
             "decisions": n_dec,
             "trade_signals": n_trade,
             "briefs": n_briefs,
+            "jev_cost_usd": jev_cost,
+            "research_cost_usd": research_cost,
             "live_orders": n_orders,
             "dry_orders": n_dry_orders,
             "resolved_markets": n_results,
