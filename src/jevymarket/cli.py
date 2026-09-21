@@ -54,7 +54,13 @@ def _researcher(s: Settings, enabled: bool) -> Researcher | None:
 
 
 def _jev(s: Settings) -> JevClient:
-    return JevClient(s.typesafe_api_key, model=s.jev_model, base_url=s.typesafe_base_url)
+    return JevClient(
+        s.typesafe_api_key,
+        model=s.jev_model,
+        base_url=s.typesafe_base_url,
+        timeout=s.jev_timeout_seconds,
+        max_retries=s.jev_max_retries,
+    )
 
 
 # ---------------------------------------------------------------------------
