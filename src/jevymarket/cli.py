@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from contextlib import suppress
 
 import typer
 from rich.console import Console
@@ -13,10 +14,10 @@ from rich.table import Table
 from . import __version__
 from .config import Settings, load_settings
 from .jev import JevClient, JevError, choice, noul, score
-from .market_data import fetch_short_term_snapshots
+from .market_data import ShortTermSnapshot, fetch_short_term_snapshots, watch_chainlink_anchors
 from .markets import TIMEFRAME_LABELS, Candidate, load_candidate, market_timeframe, scan
 from .research import Brief, Researcher, ResearchError
-from .signal import Trade, evaluate, get_brief, research_and_ask
+from .signal import Trade, evaluate, get_brief, market_data_and_ask
 from .store import Store
 
 app = typer.Typer(help="Polymarket BTC 短周期交易机器人：TypeSafe Jev + DeepSeek 官方 API。", no_args_is_help=True)
@@ -110,10 +111,14 @@ def scan_cmd(limit: int = typer.Option(15, "--limit", "-n"), pages: int = typer.
     from polymarket import AsyncPublicClient
 
     async def go():
-        async with AsyncPublicClient() as c:
-            candidates = await scan(c, s, limit=limit, pages=pages)
-            snapshots = await fetch_short_term_snapshots(c, candidates, s)
-            return candidates, snapshots
+        store = Store(s.db_path)
+        try:
+            async with AsyncPublicClient() as c:
+                candidates = await scan(c, s, limit=limit, pages=pages)
+                snapshots = await fetch_short_term_snapshots(c, candidates, s, store=store)
+                return candidates, snapshots
+        finally:
+            store.close()
 
     cands, snapshots = _run(go())
     t = Table(title=f"候选市场：{len(cands)} 个（仅 BTC 5分钟 / 15分钟 / 1小时）")
@@ -177,27 +182,38 @@ def research(ref: str = typer.Argument(..., help="Market slug or polymarket.com 
 @app.command()
 def decide(ref: str = typer.Argument(..., help="市场 slug 或 polymarket.com URL"),
            show_state: bool = typer.Option(False, help="打印发送给 Jev 的状态。"),
-           no_research: bool = typer.Option(False, "--no-research", help="跳过 DeepSeek 研究步骤。"),
-           fresh: bool = typer.Option(False, help="忽略研究缓存。")):
-    """研究单个市场并让 Jev 判断；不会真实下单。"""
+           no_research: bool = typer.Option(False, "--no-research", help="兼容参数；短周期模式默认不使用 DeepSeek。"),
+           fresh: bool = typer.Option(False, help="兼容参数；短周期模式默认不使用 DeepSeek。")):
+    """使用实时参考价格 + Jev 判断单个短周期市场；不会真实下单。"""
     s = _settings()
     from polymarket import AsyncPublicClient
 
     async def go():
+        del no_research, fresh
         store = Store(s.db_path)
-        r = _researcher(s, not no_research)
-        async with AsyncPublicClient() as c, _jev(s) as jev:
-            try:
+        try:
+            async with AsyncPublicClient() as c, _jev(s) as jev:
                 cand = await load_candidate(c, s, ref)
-                state, brief, cached, view = await research_and_ask(cand, s, store, r, jev, fresh=fresh)
-            finally:
-                if r:
-                    await r.aclose()
-            if show_state:
-                console.print_json(json.dumps(state))
-            result = evaluate(view, cand.book, s)
-            _print_decision(cand, view, result, brief, cached)
-            store.log_decision(**_decision_row(cand, state, view, result, brief, executed=False))
+                snapshots = await fetch_short_term_snapshots(c, [cand], s, store=store)
+                snapshot = snapshots.get(cand.slug)
+                _print_snapshot(snapshot)
+                if snapshot is None or not snapshot.trade_ready:
+                    console.print(
+                        "[yellow]跳过：权威参考数据不完整。"
+                        "5分钟/15分钟必须等本机在窗口起点捕获 Chainlink TWAP；"
+                        "不会用网页或其他交易所补值。[/]"
+                    )
+                    return
+                state, view = await market_data_and_ask(cand, s, jev, snapshot)
+                if show_state:
+                    console.print_json(json.dumps(state, ensure_ascii=False, default=str))
+                result = evaluate(view, cand.book, s)
+                _print_decision(cand, view, result, snapshot=snapshot)
+                store.log_decision(
+                    **_decision_row(cand, state, view, result, brief=None, executed=False)
+                )
+        finally:
+            store.close()
 
     _run(go())
 
@@ -208,7 +224,7 @@ def run(
     max_trades: int | None = typer.Option(None, help="覆盖每轮最大交易数。"),
     limit: int = typer.Option(20, "--limit", "-n", help="本轮最多分析的候选市场数量。"),
     loop: int | None = typer.Option(None, help="每 N 秒重复一轮。"),
-    no_research: bool = typer.Option(False, "--no-research", help="跳过 DeepSeek 研究步骤。"),
+    no_research: bool = typer.Option(False, "--no-research", help="兼容参数；短周期自动交易默认不使用 DeepSeek。"),
 ):
     """扫描 → 研究 → Jev 判断 → 风控 → 模拟/真实下单。"""
     s = _settings(dry_run=dry_run or None)
@@ -218,25 +234,45 @@ def run(
 
     from .executor import Executor
 
-    async def one_pass(store: Store, ex: Executor, pub: AsyncPublicClient, jev: JevClient,
-                       r: Researcher | None):
+    async def one_pass(store: Store, ex: Executor, pub: AsyncPublicClient, jev: JevClient):
         cands = await scan(pub, s, limit=limit)
-        console.rule(f"候选 {len(cands)} 个 | 当前敞口 ${(await ex.exposure(refresh=True)).total:.2f} | 模拟模式={s.dry_run}")
+        snapshots = await fetch_short_term_snapshots(pub, cands, s, store=store)
+        console.rule(
+            f"候选 {len(cands)} 个 | 当前敞口 "
+            f"${(await ex.exposure(refresh=True)).total:.2f} | 模拟模式={s.dry_run}"
+        )
         for idx, cand in enumerate(cands, start=1):
             tf = market_timeframe(cand.market, s) or "?"
-            console.print(f"\n[cyan]正在分析 {idx}/{len(cands)}：BTC {TIMEFRAME_LABELS.get(tf, tf)}[/]  [dim]{cand.slug}[/]")
-            if cand.condition_id in (await ex.exposure()).condition_ids or store.has_order_for(cand.condition_id):
+            console.print(
+                f"\n[cyan]正在分析 {idx}/{len(cands)}：BTC "
+                f"{TIMEFRAME_LABELS.get(tf, tf)}[/]  [dim]{cand.slug}[/]"
+            )
+            if (
+                cand.condition_id in (await ex.exposure()).condition_ids
+                or store.has_order_for(cand.condition_id)
+            ):
                 console.print(f"[dim]{cand.slug}：已有持仓或挂单，跳过[/]")
                 continue
+
+            snapshot = snapshots.get(cand.slug)
+            _print_snapshot(snapshot)
+            if snapshot is None or not snapshot.trade_ready:
+                console.print(
+                    "  [yellow]跳过：权威参考数据不完整；"
+                    "等待下一个窗口由 Chainlink 起始价监听器捕获目标价。[/]"
+                )
+                continue
+
             try:
-                state, brief, cached, view = await research_and_ask(cand, s, store, r, jev)
+                state, view = await market_data_and_ask(cand, s, jev, snapshot)
             except JevError as e:
                 console.print(f"[red]{cand.slug}: {e}[/]")
                 if e.status in (401, 402):
                     raise
                 continue
+
             result = evaluate(view, cand.book, s)
-            _print_decision(cand, view, result, brief, cached)
+            _print_decision(cand, view, result, snapshot=snapshot)
             executed = False
             if isinstance(result, Trade):
                 placed = await ex.place(cand, result)
@@ -244,37 +280,66 @@ def run(
                 if not placed.ok:
                     console.print(f"  [yellow]{_status_cn(placed.status)}：{placed.message}[/]")
                 else:
-                    console.print(f"  [green]{_status_cn(placed.status)}[/] 订单ID={placed.order_id}")
-            store.log_decision(**_decision_row(cand, state, view, result, brief, executed=executed))
+                    console.print(
+                        f"  [green]{_status_cn(placed.status)}[/] "
+                        f"订单ID={placed.order_id}"
+                    )
+
+            store.log_decision(
+                **_decision_row(cand, state, view, result, brief=None, executed=executed)
+            )
             if ex.trades_this_run >= s.max_trades_per_run:
                 console.print("[bold]本轮交易数量已达到上限[/]")
                 break
-        spend = f"Jev：{jev.calls} 次调用，输入 {jev.total_input_tokens} / 输出 {jev.total_output_tokens} tokens"
-        if r:
-            spend += f" | DeepSeek：{r.calls} 份研究，输入 {r.total_input_tokens} / 输出 {r.total_output_tokens} tokens"
-        console.print(f"[dim]{spend}[/]")
+
+        console.print(
+            f"[dim]Jev：{jev.calls} 次调用，输入 {jev.total_input_tokens} / "
+            f"输出 {jev.total_output_tokens} tokens | DeepSeek：短周期模式未调用[/]"
+        )
 
     async def go():
+        del no_research
         store = Store(s.db_path)
         ex = await Executor.create(s, store, dry_run=s.dry_run)
-        r = _researcher(s, not no_research)
+        watcher = asyncio.create_task(watch_chainlink_anchors(s, store))
         try:
             async with AsyncPublicClient() as pub, _jev(s) as jev:
                 while True:
                     ex.trades_this_run = 0
-                    if r:
-                        r.calls = 0
-                    await one_pass(store, ex, pub, jev, r)
+                    await one_pass(store, ex, pub, jev)
                     if loop is None:
                         break
                     await asyncio.sleep(loop)
         finally:
-            if r:
-                await r.aclose()
+            watcher.cancel()
+            with suppress(asyncio.CancelledError):
+                await watcher
             await ex.close()
             store.close()
 
     _run(go())
+
+
+@app.command("watch-prices")
+def watch_prices():
+    """持续监听 Chainlink，并在 5分钟/15分钟窗口起点保存权威目标价。"""
+    s = _settings()
+
+    async def go():
+        store = Store(s.db_path)
+        console.print(
+            "[cyan]开始监听 Chainlink BTC/USD TWAP 30s/60s。"
+            "请保持运行；捕获到新窗口起始价时会自动写入 SQLite。[/]"
+        )
+        try:
+            await watch_chainlink_anchors(s, store)
+        finally:
+            store.close()
+
+    try:
+        _run(go())
+    except KeyboardInterrupt:
+        console.print("\n[dim]已停止价格监听。[/]")
 
 
 @app.command()
@@ -410,7 +475,25 @@ def _status_cn(status: str) -> str:
     }.get(status, status)
 
 
-def _print_decision(c: Candidate, v, result, brief: Brief | None = None, cached: bool = False) -> None:
+def _print_snapshot(snapshot: ShortTermSnapshot | None) -> None:
+    if snapshot is None:
+        console.print("  [yellow]参考数据：未获取[/]")
+        return
+    readiness = "[green]完整[/]" if snapshot.trade_ready else "[yellow]不完整[/]"
+    console.print(
+        f"  参考数据：目标价 {_fmt_usd(snapshot.target_price)}；"
+        f"当前价 {_fmt_usd(snapshot.current_price)}；"
+        f"差值 {_fmt_delta(snapshot.delta_usd)}；"
+        f"剩余 {_fmt_seconds(snapshot.seconds_left)}；状态 {readiness}"
+    )
+    console.print(
+        f"  [dim]目标价源={snapshot.target_source or '缺失'}；"
+        f"当前价源={snapshot.current_source or '缺失'}[/]"
+    )
+
+
+def _print_decision(c: Candidate, v, result, brief: Brief | None = None, cached: bool = False,
+                    snapshot: ShortTermSnapshot | None = None) -> None:
     tf = market_timeframe(c.market, _settings()) or "?"
     primary = _outcome_cn(c.book.yes_label)
     secondary = _outcome_cn(c.book.no_label)
@@ -424,6 +507,8 @@ def _print_decision(c: Candidate, v, result, brief: Brief | None = None, cached:
         f"规则清晰度={v.clarity_mean}（置信度 {v.clarity_confidence}）"
     )
     console.print(head)
+    if snapshot is not None:
+        _print_snapshot(snapshot)
     if brief is not None:
         _print_brief(brief, cached)
     if isinstance(result, Trade):
