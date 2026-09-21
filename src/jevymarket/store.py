@@ -20,6 +20,7 @@ CREATE TABLE IF NOT EXISTS decisions (
     p_yes REAL,
     jev_p_yes REAL,
     timeframe TEXT,
+    strategy_version TEXT,
     answerable REAL,
     clarity INTEGER,
     yes_ask REAL,
@@ -93,6 +94,26 @@ CREATE TABLE IF NOT EXISTS market_results (
 );
 CREATE INDEX IF NOT EXISTS idx_market_results_timeframe
 ON market_results(timeframe, resolved_ts);
+CREATE TABLE IF NOT EXISTS evaluation_samples (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    slug TEXT NOT NULL,
+    condition_id TEXT,
+    timeframe TEXT NOT NULL,
+    strategy_version TEXT NOT NULL,
+    checkpoint_seconds INTEGER NOT NULL,
+    ts REAL NOT NULL,
+    seconds_left INTEGER NOT NULL,
+    quant_p REAL,
+    jev_p REAL,
+    market_p REAL,
+    yes_ask REAL,
+    no_ask REAL,
+    book_json TEXT,
+    state_json TEXT,
+    UNIQUE(slug, strategy_version, checkpoint_seconds)
+);
+CREATE INDEX IF NOT EXISTS idx_eval_samples_version
+ON evaluation_samples(strategy_version, timeframe, checkpoint_seconds);
 """
 
 
@@ -112,6 +133,8 @@ class Store:
             self.conn.execute("ALTER TABLE decisions ADD COLUMN jev_p_yes REAL")
         if "timeframe" not in cols:
             self.conn.execute("ALTER TABLE decisions ADD COLUMN timeframe TEXT")
+        if "strategy_version" not in cols:
+            self.conn.execute("ALTER TABLE decisions ADD COLUMN strategy_version TEXT")
 
         anchor_info = self.conn.execute("PRAGMA table_info(price_anchors)").fetchall()
         pk_cols = [r["name"] for r in sorted(anchor_info, key=lambda row: row["pk"]) if r["pk"]]
@@ -369,6 +392,66 @@ class Store:
                     break
         return pending
 
+    # --- fixed checkpoint evaluation samples ----------------------------------
+
+    def log_evaluation_sample(
+        self,
+        *,
+        slug: str,
+        condition_id: str | None,
+        timeframe: str,
+        strategy_version: str,
+        checkpoint_seconds: int,
+        seconds_left: int,
+        quant_p: float | None,
+        jev_p: float | None,
+        market_p: float | None,
+        yes_ask: float | None,
+        no_ask: float | None,
+        book_json: dict | None,
+        state_json: dict | None,
+        ts: float | None = None,
+    ) -> bool:
+        cur = self.conn.execute(
+            """
+            INSERT OR IGNORE INTO evaluation_samples
+            (slug, condition_id, timeframe, strategy_version, checkpoint_seconds,
+             ts, seconds_left, quant_p, jev_p, market_p, yes_ask, no_ask,
+             book_json, state_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                slug,
+                condition_id,
+                timeframe,
+                strategy_version,
+                int(checkpoint_seconds),
+                ts or time.time(),
+                int(seconds_left),
+                quant_p,
+                jev_p,
+                market_p,
+                yes_ask,
+                no_ask,
+                json.dumps(book_json, default=str) if book_json is not None else None,
+                json.dumps(state_json, default=str) if state_json is not None else None,
+            ),
+        )
+        self.conn.commit()
+        return cur.rowcount > 0
+
+    def evaluation_sample_count(self, strategy_version: str | None = None) -> int:
+        if strategy_version is None:
+            return int(
+                self.conn.execute("SELECT COUNT(*) FROM evaluation_samples").fetchone()[0]
+            )
+        return int(
+            self.conn.execute(
+                "SELECT COUNT(*) FROM evaluation_samples WHERE strategy_version = ?",
+                (strategy_version,),
+            ).fetchone()[0]
+        )
+
     # --- research cache ------------------------------------------------------
 
     def get_brief(self, slug: str, max_age_s: float) -> dict | None:
@@ -423,6 +506,18 @@ class Store:
         ).fetchone()[0]
         n_results = c.execute("SELECT COUNT(*) FROM market_results").fetchone()[0]
         n_briefs = c.execute("SELECT COUNT(*) FROM research").fetchone()[0]
+        versions = [
+            dict(row)
+            for row in c.execute(
+                """
+                SELECT COALESCE(strategy_version, 'legacy') AS strategy_version,
+                       COUNT(*) AS n
+                FROM decisions
+                GROUP BY COALESCE(strategy_version, 'legacy')
+                ORDER BY n DESC
+                """
+            ).fetchall()
+        ]
         jev_cost = c.execute(
             "SELECT COALESCE(SUM(jev_cost),0) FROM decisions"
         ).fetchone()[0]
@@ -450,6 +545,8 @@ class Store:
             "decisions": n_dec,
             "trade_signals": n_trade,
             "briefs": n_briefs,
+            "strategy_versions": versions,
+            "evaluation_samples": self.evaluation_sample_count(),
             "jev_cost_usd": jev_cost,
             "research_cost_usd": research_cost,
             "live_orders": n_orders,
