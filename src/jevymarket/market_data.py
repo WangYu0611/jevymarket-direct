@@ -593,6 +593,13 @@ async def fetch_short_term_snapshots(
         if timeframe in {"5m", "15m"}:
             twap_window = chainlink_twap_window_seconds(candidate)
             anchor = store.get_price_anchor(candidate.slug, twap_window) if store else None
+            if anchor is None and store is not None:
+                anchor = recover_chainlink_anchor_from_history(
+                    settings,
+                    store,
+                    candidate,
+                    twap_window=twap_window,
+                )
             if anchor is not None:
                 target = float(anchor["price"])
                 target_source = str(anchor["source"])
@@ -670,6 +677,45 @@ def _source_event_time(event: Any) -> datetime:
     return _normalize_event_time(getattr(event, "timestamp", None))
 
 
+def recover_chainlink_anchor_from_history(
+    settings: Settings,
+    store: Store,
+    candidate: Candidate,
+    *,
+    twap_window: int,
+) -> dict | None:
+    """Recover a missed boundary anchor from locally persisted TWAP samples."""
+    window = market_window(candidate.market, settings)
+    if window is None:
+        return None
+    start = window[0]
+    grace = float(settings.anchor_capture_grace_seconds)
+    rows = store.get_price_samples(
+        source="chainlink_twap",
+        twap_window=twap_window,
+        since_ts=start.timestamp(),
+        until_ts=start.timestamp() + grace,
+    )
+    if not rows:
+        return None
+    row = rows[0]
+    price = float(row["price"])
+    observed_ts = float(row["ts"])
+    timeframe = market_timeframe(candidate.market, settings)
+    if timeframe is None:
+        return None
+    store.put_price_anchor(
+        slug=candidate.slug,
+        timeframe=timeframe,
+        window_start=start.timestamp(),
+        twap_window=twap_window,
+        price=price,
+        observed_ts=observed_ts,
+        source=f"Polymarket RTDS · Chainlink BTC/USD TWAP {twap_window}s 历史恢复",
+    )
+    return store.get_price_anchor(candidate.slug, twap_window)
+
+
 def record_chainlink_anchor_event(
     settings: Settings,
     store: Store,
@@ -718,70 +764,154 @@ def record_chainlink_anchor_event(
     return inserted_slugs
 
 
+async def _next_stream_event(stream, *, timeout_seconds: float):
+    try:
+        async with asyncio.timeout(timeout_seconds):
+            return await anext(stream)
+    except TimeoutError as exc:
+        raise RuntimeError(
+            f"Chainlink stream silent for {timeout_seconds:.0f}s"
+        ) from exc
+
+
+async def _watch_chainlink_raw(
+    store: Store,
+    *,
+    silence_timeout_seconds: float = 20.0,
+) -> None:
+    """Persist raw Chainlink BTC/USD samples; reconnect on errors or silent stalls."""
+    while True:
+        client = AsyncPublicClient()
+        try:
+            # RTDS raw Chainlink symbols may be uppercase (BTC/USD). The SDK's
+            # symbols filter is case-sensitive, so subscribe without a symbol
+            # filter and normalize locally.
+            spec = CryptoPricesSpec(topic="prices.crypto.chainlink")
+            async with await client.subscribe(spec) as stream:
+                while True:
+                    event = await _next_stream_event(
+                        stream,
+                        timeout_seconds=silence_timeout_seconds,
+                    )
+                    if str(event.payload.symbol).lower() != "btc/usd":
+                        continue
+                    price = _float_or_none(event.payload.value)
+                    if price is None:
+                        continue
+                    observed = _source_event_time(event)
+                    store.put_price_sample(
+                        source="chainlink_spot",
+                        price=price,
+                        observed_ts=observed.timestamp(),
+                    )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Chainlink 原始价监听异常：%s；2 秒后重连", exc)
+            await asyncio.sleep(2)
+        finally:
+            await client.close()
+
+
+async def _watch_chainlink_twap(
+    settings: Settings,
+    store: Store,
+    *,
+    window_seconds: int,
+    on_capture: Callable[[str, int, float], None] | None = None,
+    silence_timeout_seconds: float = 20.0,
+) -> None:
+    """Persist one Chainlink TWAP window and capture recurring market anchors."""
+    while True:
+        client = AsyncPublicClient()
+        try:
+            # TWAP is also filtered locally so capitalization cannot starve the
+            # subscription due to SDK-side case-sensitive matching.
+            spec = CryptoPricesChainlinkTwapSpec(window_seconds=window_seconds)
+            async with await client.subscribe(spec) as stream:
+                while True:
+                    event = await _next_stream_event(
+                        stream,
+                        timeout_seconds=silence_timeout_seconds,
+                    )
+                    if str(event.payload.symbol).lower() != "btc/usd":
+                        continue
+                    price = _float_or_none(event.payload.value)
+                    if price is None:
+                        continue
+                    observed = _source_event_time(event)
+                    observed_ts = observed.timestamp()
+                    store.put_price_sample(
+                        source="chainlink_twap",
+                        twap_window=window_seconds,
+                        price=price,
+                        observed_ts=observed_ts,
+                    )
+                    inserted_slugs = record_chainlink_anchor_event(
+                        settings,
+                        store,
+                        observed=observed,
+                        price=price,
+                        twap_window=window_seconds,
+                    )
+                    if on_capture is not None:
+                        for slug in inserted_slugs:
+                            on_capture(slug, window_seconds, price)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "Chainlink TWAP %ss 监听异常：%s；2 秒后重连",
+                window_seconds,
+                exc,
+            )
+            await asyncio.sleep(2)
+        finally:
+            await client.close()
+
+
+async def _prune_chainlink_history(store: Store) -> None:
+    while True:
+        await asyncio.sleep(300)
+        store.prune_price_samples(datetime.now(UTC).timestamp() - 21_600)
+
+
 async def watch_chainlink_anchors(
     settings: Settings,
     store: Store,
     *,
     on_capture: Callable[[str, int, float], None] | None = None,
 ) -> None:
-    """Capture Chainlink anchors and raw BTC/USD history continuously."""
+    """Run independent self-healing raw/30s/60s Chainlink listeners."""
     if not any(
         value.strip().lower() in {"5m", "15m"}
         for value in settings.allowed_timeframes.split(",")
     ):
         return
 
-    specs = [
-        CryptoPricesSpec(topic="prices.crypto.chainlink", symbols=["btc/usd"]),
-        CryptoPricesChainlinkTwapSpec(window_seconds=30, symbols=["btc/usd"]),
-        CryptoPricesChainlinkTwapSpec(window_seconds=60, symbols=["btc/usd"]),
+    tasks = [
+        asyncio.create_task(_watch_chainlink_raw(store)),
+        asyncio.create_task(
+            _watch_chainlink_twap(
+                settings,
+                store,
+                window_seconds=30,
+                on_capture=on_capture,
+            )
+        ),
+        asyncio.create_task(
+            _watch_chainlink_twap(
+                settings,
+                store,
+                window_seconds=60,
+                on_capture=on_capture,
+            )
+        ),
+        asyncio.create_task(_prune_chainlink_history(store)),
     ]
-    last_prune = 0.0
-
-    while True:
-        client = AsyncPublicClient()
-        try:
-            async with await client.subscribe(specs) as stream:
-                async for event in stream:
-                    observed = _source_event_time(event)
-                    price = _float_or_none(event.payload.value)
-                    if price is None:
-                        continue
-                    observed_ts = observed.timestamp()
-
-                    if event.topic == "prices.crypto.chainlink":
-                        store.put_price_sample(
-                            source="chainlink_spot",
-                            price=price,
-                            observed_ts=observed_ts,
-                        )
-                    elif event.topic == "prices.crypto.chainlink.twap":
-                        twap_window = int(event.payload.window_seconds)
-                        store.put_price_sample(
-                            source="chainlink_twap",
-                            twap_window=twap_window,
-                            price=price,
-                            observed_ts=observed_ts,
-                        )
-                        inserted_slugs = record_chainlink_anchor_event(
-                            settings,
-                            store,
-                            observed=observed,
-                            price=price,
-                            twap_window=twap_window,
-                        )
-                        if on_capture is not None:
-                            for slug in inserted_slugs:
-                                on_capture(slug, twap_window, price)
-
-                    if observed_ts - last_prune >= 300:
-                        store.prune_price_samples(observed_ts - 21_600)
-                        last_prune = observed_ts
-
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:  # noqa: BLE001
-            log.warning("Chainlink 实时价格监听断开：%s；3 秒后重连", exc)
-            await asyncio.sleep(3)
-        finally:
-            await client.close()
+    try:
+        await asyncio.gather(*tasks)
+    finally:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
