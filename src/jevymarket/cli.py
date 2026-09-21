@@ -13,12 +13,12 @@ from rich.table import Table
 from . import __version__
 from .config import Settings, load_settings
 from .jev import JevClient, JevError, choice, noul, score
-from .markets import Candidate, load_candidate, scan
+from .markets import TIMEFRAME_LABELS, Candidate, load_candidate, market_timeframe, scan
 from .research import Brief, Researcher, ResearchError
 from .signal import Trade, evaluate, get_brief, research_and_ask
 from .store import Store
 
-app = typer.Typer(help="Polymarket trading bot driven by Jev via TypeSafe + DeepSeek official APIs.", no_args_is_help=True)
+app = typer.Typer(help="Polymarket BTC 短周期交易机器人：TypeSafe Jev + DeepSeek 官方 API。", no_args_is_help=True)
 console = Console()
 log = logging.getLogger("jevymarket")
 
@@ -104,7 +104,7 @@ def jev_test(raw: bool = typer.Option(False, help="Print the raw JSON response o
 
 @app.command("scan")
 def scan_cmd(limit: int = typer.Option(15, "--limit", "-n"), pages: int = typer.Option(5)):
-    """List candidate markets that pass the static filters, with live best bid/ask."""
+    """扫描符合条件的 BTC 5分钟 / 15分钟 / 1小时涨跌市场。"""
     s = _settings()
     from polymarket import AsyncPublicClient
 
@@ -113,22 +113,23 @@ def scan_cmd(limit: int = typer.Option(15, "--limit", "-n"), pages: int = typer.
             return await scan(c, s, limit=limit, pages=pages)
 
     cands = _run(go())
-    t = Table(title=f"{len(cands)} candidates")
-    for col in ("slug", "yes bid", "yes ask", "no ask", "days", "liq $", "vol $"):
-        t.add_column(col, justify="right" if col != "slug" else "left")
-    for c in cands:
-        m = c.market
-        t.add_row(c.slug[:70], _fmt(c.book.yes_bid), _fmt(c.book.yes_ask), _fmt(c.book.no_ask),
-                  str(c.days_to_resolution), f"{float(m.metrics.liquidity_num or 0):,.0f}",
-                  f"{float(m.metrics.volume_num or 0):,.0f}")
+    t = Table(title=f"候选市场：{len(cands)} 个（仅 BTC 5分钟 / 15分钟 / 1小时）")
+    for col in ("市场 slug", "周期", "上涨买价", "上涨卖价", "下跌卖价", "流动性 $", "成交量 $"):
+        t.add_column(col, justify="right" if col not in ("市场 slug", "周期") else "left")
+    for cand in cands:
+        m = cand.market
+        tf = market_timeframe(m, s) or "?"
+        t.add_row(cand.slug[:72], TIMEFRAME_LABELS.get(tf, tf), _fmt(cand.book.yes_bid),
+                  _fmt(cand.book.yes_ask), _fmt(cand.book.no_ask),
+                  f"{float(m.metrics.liquidity_num or 0):,.0f}", f"{float(m.metrics.volume_num or 0):,.0f}")
     console.print(t)
 
 
 
 @app.command()
 def research(ref: str = typer.Argument(..., help="Market slug or polymarket.com URL"),
-             fresh: bool = typer.Option(False, help="Ignore the cache and research again.")):
-    """Run only the researcher for one market and print the evidence brief."""
+             fresh: bool = typer.Option(False, help="忽略缓存并重新研究。")):
+    """只运行研究步骤并打印证据摘要。"""
     s = _settings()
     from polymarket import AsyncPublicClient
 
@@ -139,9 +140,10 @@ def research(ref: str = typer.Argument(..., help="Market slug or polymarket.com 
                        exclude_domains=s.research_exclude_domains)
         async with AsyncPublicClient() as c, r:
             cand = await load_candidate(c, s, ref)
+            console.print(f"[cyan]正在研究：{cand.slug}[/]")
             brief, cached = await get_brief(cand, s, store, r, fresh=fresh)
             if brief is None:
-                console.print("[red]no brief produced[/]")
+                console.print("[red]没有生成有效研究摘要[/]")
                 raise typer.Exit(1) from None
             console.print(f"[bold]{cand.question}[/]")
             _print_brief(brief, cached, full=True)
@@ -185,7 +187,7 @@ def run(
     loop: int | None = typer.Option(None, help="Repeat every N seconds."),
     no_research: bool = typer.Option(False, "--no-research", help="Skip the researcher step."),
 ):
-    """Scan → research → ask Jev → trade edges above threshold, under hard caps."""
+    """扫描 → 研究 → Jev 判断 → 风控 → 模拟/真实下单。"""
     s = _settings(dry_run=dry_run or None)
     if max_trades is not None:
         s.max_trades_per_run = max_trades
@@ -196,10 +198,12 @@ def run(
     async def one_pass(store: Store, ex: Executor, pub: AsyncPublicClient, jev: JevClient,
                        r: Researcher | None):
         cands = await scan(pub, s, limit=limit)
-        console.rule(f"{len(cands)} candidates | exposure ${ (await ex.exposure(refresh=True)).total:.2f} | dry_run={s.dry_run}")
-        for cand in cands:
+        console.rule(f"候选 {len(cands)} 个 | 当前敞口 ${(await ex.exposure(refresh=True)).total:.2f} | 模拟模式={s.dry_run}")
+        for idx, cand in enumerate(cands, start=1):
+            tf = market_timeframe(cand.market, s) or "?"
+            console.print(f"\n[cyan]正在分析 {idx}/{len(cands)}：BTC {TIMEFRAME_LABELS.get(tf, tf)}[/]  [dim]{cand.slug}[/]")
             if cand.condition_id in (await ex.exposure()).condition_ids or store.has_order_for(cand.condition_id):
-                console.print(f"[dim]{cand.slug}: already exposed, skip[/]")
+                console.print(f"[dim]{cand.slug}：已有持仓或挂单，跳过[/]")
                 continue
             try:
                 state, brief, cached, view = await research_and_ask(cand, s, store, r, jev)
@@ -220,11 +224,11 @@ def run(
                     console.print(f"  [green]{placed.status}[/] order_id={placed.order_id}")
             store.log_decision(**_decision_row(cand, state, view, result, brief, executed=executed))
             if ex.trades_this_run >= s.max_trades_per_run:
-                console.print("[bold]trade cap for this run reached[/]")
+                console.print("[bold]本轮交易数量已达到上限[/]")
                 break
-        spend = f"Jev: {jev.calls} calls, {jev.total_input_tokens} in/{jev.total_output_tokens} out tokens"
+        spend = f"Jev：{jev.calls} 次调用，输入 {jev.total_input_tokens} / 输出 {jev.total_output_tokens} tokens"
         if r:
-            spend += f" | researcher: {r.calls} briefs, {r.total_input_tokens} in/{r.total_output_tokens} out tokens"
+            spend += f" | DeepSeek：{r.calls} 份研究，输入 {r.total_input_tokens} / 输出 {r.total_output_tokens} tokens"
         console.print(f"[dim]{spend}[/]")
 
     async def go():
@@ -259,7 +263,7 @@ def setup():
     async def go():
         ex = await Executor.create(s, Store(s.db_path), dry_run=False)
         try:
-            console.print(f"wallet {ex.wallet} ({ex.wallet_type})")
+            console.print(f"钱包 {ex.wallet}（{ex.wallet_type}）")
             console.print(await ex.setup_approvals())
         finally:
             await ex.close()
@@ -278,21 +282,21 @@ def positions():
         try:
             bal = await ex.collateral_balance_usd()
             console.print(f"wallet {ex.wallet} ({ex.wallet_type})  pUSD: {'n/a (no key)' if bal is None else f'${bal:,.2f}'}")
-            t = Table(title="open positions")
+            t = Table(title="当前持仓")
             for col in ("slug", "outcome", "size", "avg", "cur", "value $", "pnl $"):
                 t.add_column(col)
             async for p in ex.client.list_positions(user=ex.wallet, status="OPEN").iter_items():
                 t.add_row(str(p.slug)[:60], str(p.outcome), f"{float(p.current_size or 0):.2f}", f"{float(p.avg_price or 0):.3f}",
                           f"{float(p.current_price or 0):.3f}", f"{float(p.current_value or 0):.2f}", f"{float(p.total_pnl or 0):+.2f}")
             console.print(t)
-            t2 = Table(title="open orders")
+            t2 = Table(title="当前挂单")
             for col in ("id", "side", "outcome", "price", "size", "matched", "status"):
                 t2.add_column(col)
             async for o in (ex.client.list_open_orders().iter_items() if ex.authenticated else _empty()):
                 t2.add_row(str(o.id)[:12], str(o.side), str(o.outcome), str(o.price), str(o.original_size), str(o.size_matched), str(o.status))
             console.print(t2)
             exx = await ex.exposure(refresh=True)
-            console.print(f"exposure: positions ${exx.positions_usd:.2f} + open orders ${exx.open_orders_usd:.2f} = ${exx.total:.2f} (cap ${s.max_open_exposure_usd:.2f})")
+            console.print(f"敞口：持仓 ${exx.positions_usd:.2f} + 挂单 ${exx.open_orders_usd:.2f} = ${exx.total:.2f}（上限 ${s.max_open_exposure_usd:.2f}）")
         finally:
             await ex.close()
 
@@ -307,7 +311,7 @@ def stats():
     console.print(f"decisions={st['decisions']} trade_signals={st['trade_signals']} briefs={st['briefs']} "
                   f"live_orders={st['live_orders']} live_usd=${st['live_usd']:.2f} "
                   "provider_cost=n/a (direct APIs report tokens, not per-request cost)")
-    t = Table(title="Jev P(yes) buckets vs market midpoint")
+    t = Table(title="Jev 主方向概率分桶 vs 市场中间价")
     for col in ("bucket", "n", "avg jev", "avg market"):
         t.add_column(col, justify="right")
     for b in st["buckets"]:
@@ -328,18 +332,18 @@ def _fmt(x: float | None) -> str:
 
 
 def _print_brief(b: Brief, cached: bool, full: bool = False) -> None:
-    tag = "cached" if cached else "direct API"
+    tag = "缓存" if cached else "官方 API"
     console.print(f"  [cyan]evidence[/] as of {b.as_of or '?'} ({b.model or 'researcher'}, {tag}): {b.summary}")
     if not full:
         return
     for f in b.key_facts:
         console.print(f"    • {f}")
     if b.latest_development:
-        console.print(f"    latest: {b.latest_development}")
+        console.print(f"    最新进展：{b.latest_development}")
     if b.for_yes:
-        console.print("    [green]for YES:[/] " + " | ".join(b.for_yes))
+        console.print("    [green]支持主方向：[/] " + " | ".join(b.for_yes))
     if b.against_yes:
-        console.print("    [red]against YES:[/] " + " | ".join(b.against_yes))
+        console.print("    [red]反对主方向：[/] " + " | ".join(b.against_yes))
     for u in b.sources[:8]:
         console.print(f"    [dim]{u}[/]")
 
