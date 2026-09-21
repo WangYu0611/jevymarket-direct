@@ -1,13 +1,13 @@
 [project]
 name = "jevymarket"
 version = "0.1.0"
-description = "Polymarket trading bot driven by Jev (TypeSafe AI's System One decision model) via OpenRouter"
+description = "Polymarket trading bot driven by Jev via TypeSafe and DeepSeek official APIs"
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
 authors = [{ name = "Markus Haas" }]
 requires-python = ">=3.12"
-keywords = ["polymarket", "prediction-markets", "trading-bot", "jev", "typesafe", "openrouter"]
+keywords = ["polymarket", "prediction-markets", "trading-bot", "jev", "typesafe", "deepseek"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Environment :: Console",
