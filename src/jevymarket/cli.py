@@ -152,11 +152,11 @@ def research(ref: str = typer.Argument(..., help="Market slug or polymarket.com 
 
 
 @app.command()
-def decide(ref: str = typer.Argument(..., help="Market slug or polymarket.com URL"),
-           show_state: bool = typer.Option(False, help="Print the state sent to Jev."),
-           no_research: bool = typer.Option(False, "--no-research", help="Skip the researcher step."),
-           fresh: bool = typer.Option(False, help="Ignore the research cache.")):
-    """Research + ask Jev about one market and show the proposed trade. Never places orders."""
+def decide(ref: str = typer.Argument(..., help="市场 slug 或 polymarket.com URL"),
+           show_state: bool = typer.Option(False, help="打印发送给 Jev 的状态。"),
+           no_research: bool = typer.Option(False, "--no-research", help="跳过 DeepSeek 研究步骤。"),
+           fresh: bool = typer.Option(False, help="忽略研究缓存。")):
+    """研究单个市场并让 Jev 判断；不会真实下单。"""
     s = _settings()
     from polymarket import AsyncPublicClient
 
@@ -181,11 +181,11 @@ def decide(ref: str = typer.Argument(..., help="Market slug or polymarket.com UR
 
 @app.command()
 def run(
-    dry_run: bool = typer.Option(False, "--dry-run", help="Evaluate and log, but place no orders."),
-    max_trades: int | None = typer.Option(None, help="Override MAX_TRADES_PER_RUN."),
-    limit: int = typer.Option(20, "--limit", "-n", help="Max candidate markets to evaluate."),
-    loop: int | None = typer.Option(None, help="Repeat every N seconds."),
-    no_research: bool = typer.Option(False, "--no-research", help="Skip the researcher step."),
+    dry_run: bool = typer.Option(False, "--dry-run", help="只评估和记录，不真实下单。"),
+    max_trades: int | None = typer.Option(None, help="覆盖每轮最大交易数。"),
+    limit: int = typer.Option(20, "--limit", "-n", help="本轮最多分析的候选市场数量。"),
+    loop: int | None = typer.Option(None, help="每 N 秒重复一轮。"),
+    no_research: bool = typer.Option(False, "--no-research", help="跳过 DeepSeek 研究步骤。"),
 ):
     """扫描 → 研究 → Jev 判断 → 风控 → 模拟/真实下单。"""
     s = _settings(dry_run=dry_run or None)
@@ -219,9 +219,9 @@ def run(
                 placed = await ex.place(cand, result)
                 executed = placed.ok
                 if not placed.ok:
-                    console.print(f"  [yellow]{placed.status}: {placed.message}[/]")
+                    console.print(f"  [yellow]{_status_cn(placed.status)}：{placed.message}[/]")
                 else:
-                    console.print(f"  [green]{placed.status}[/] order_id={placed.order_id}")
+                    console.print(f"  [green]{_status_cn(placed.status)}[/] 订单ID={placed.order_id}")
             store.log_decision(**_decision_row(cand, state, view, result, brief, executed=executed))
             if ex.trades_this_run >= s.max_trades_per_run:
                 console.print("[bold]本轮交易数量已达到上限[/]")
@@ -281,16 +281,16 @@ def positions():
         ex = await Executor.create(s, Store(s.db_path), dry_run=True)
         try:
             bal = await ex.collateral_balance_usd()
-            console.print(f"wallet {ex.wallet} ({ex.wallet_type})  pUSD: {'n/a (no key)' if bal is None else f'${bal:,.2f}'}")
+            console.print(f"钱包 {ex.wallet}（{ex.wallet_type}） pUSD：{'无私钥，无法查询' if bal is None else f'${bal:,.2f}'}")
             t = Table(title="当前持仓")
-            for col in ("slug", "outcome", "size", "avg", "cur", "value $", "pnl $"):
+            for col in ("市场", "方向", "数量", "均价", "现价", "价值 $", "盈亏 $"):
                 t.add_column(col)
             async for p in ex.client.list_positions(user=ex.wallet, status="OPEN").iter_items():
                 t.add_row(str(p.slug)[:60], str(p.outcome), f"{float(p.current_size or 0):.2f}", f"{float(p.avg_price or 0):.3f}",
                           f"{float(p.current_price or 0):.3f}", f"{float(p.current_value or 0):.2f}", f"{float(p.total_pnl or 0):+.2f}")
             console.print(t)
             t2 = Table(title="当前挂单")
-            for col in ("id", "side", "outcome", "price", "size", "matched", "status"):
+            for col in ("订单ID", "买卖", "方向", "价格", "数量", "已成交", "状态"):
                 t2.add_column(col)
             async for o in (ex.client.list_open_orders().iter_items() if ex.authenticated else _empty()):
                 t2.add_row(str(o.id)[:12], str(o.side), str(o.outcome), str(o.price), str(o.original_size), str(o.size_matched), str(o.status))
@@ -308,11 +308,10 @@ def stats():
     """Decision/order counts and a rough Jev-vs-market calibration table."""
     s = _settings()
     st = Store(s.db_path).stats()
-    console.print(f"decisions={st['decisions']} trade_signals={st['trade_signals']} briefs={st['briefs']} "
-                  f"live_orders={st['live_orders']} live_usd=${st['live_usd']:.2f} "
-                  "provider_cost=n/a (direct APIs report tokens, not per-request cost)")
+    console.print(f"决策数={st['decisions']} 交易信号={st['trade_signals']} 研究摘要={st['briefs']} "
+                  f"真实订单={st['live_orders']} 真实金额=${st['live_usd']:.2f}")
     t = Table(title="Jev 主方向概率分桶 vs 市场中间价")
-    for col in ("bucket", "n", "avg jev", "avg market"):
+    for col in ("概率区间", "样本数", "Jev均值", "市场均值"):
         t.add_column(col, justify="right")
     for b in st["buckets"]:
         t.add_row(f"{b['b']/10:.1f}-{(b['b']+1)/10:.1f}", str(b["n"]), f"{b['avg_p']:.2f}", f"{b['avg_mkt']:.2f}")
@@ -333,7 +332,7 @@ def _fmt(x: float | None) -> str:
 
 def _print_brief(b: Brief, cached: bool, full: bool = False) -> None:
     tag = "缓存" if cached else "官方 API"
-    console.print(f"  [cyan]evidence[/] as of {b.as_of or '?'} ({b.model or 'researcher'}, {tag}): {b.summary}")
+    console.print(f"  [cyan]研究证据[/] 截至 {b.as_of or '?'}（{b.model or '研究模型'}，{tag}）：{b.summary}")
     if not full:
         return
     for f in b.key_facts:
@@ -348,19 +347,42 @@ def _print_brief(b: Brief, cached: bool, full: bool = False) -> None:
         console.print(f"    [dim]{u}[/]")
 
 
+def _outcome_cn(label: str) -> str:
+    return {"UP": "上涨", "DOWN": "下跌", "YES": "是", "NO": "否"}.get(label.upper(), label)
+
+
+def _status_cn(status: str) -> str:
+    return {
+        "dry_run": "模拟下单",
+        "refused": "已拒绝",
+        "rejected": "交易所拒绝",
+        "live": "已提交",
+    }.get(status, status)
+
+
 def _print_decision(c: Candidate, v, result, brief: Brief | None = None, cached: bool = False) -> None:
-    head = (f"[bold]{c.slug}[/]\n  {c.question}\n"
-            f"  market yes bid/ask {_fmt(c.book.yes_bid)}/{_fmt(c.book.yes_ask)}  no ask {_fmt(c.book.no_ask)}  "
-            f"days={c.days_to_resolution}\n"
-            f"  Jev: p_yes={v.p_yes:.2f} answerable={v.answerable:.2f} clarity={v.clarity_mean} "
-            f"(conf {v.clarity_confidence})")
+    tf = market_timeframe(c.market, _settings()) or "?"
+    primary = _outcome_cn(c.book.yes_label)
+    secondary = _outcome_cn(c.book.no_label)
+    head = (
+        f"[bold]{c.slug}[/]\n"
+        f"  市场：BTC {TIMEFRAME_LABELS.get(tf, tf)}涨跌\n"
+        f"  原始问题：{c.question}\n"
+        f"  盘口：{primary} 买价/卖价 {_fmt(c.book.yes_bid)}/{_fmt(c.book.yes_ask)}；"
+        f"{secondary} 卖价 {_fmt(c.book.no_ask)}\n"
+        f"  Jev：P({primary})={v.p_yes:.2f}  信息充分度={v.answerable:.2f}  "
+        f"规则清晰度={v.clarity_mean}（置信度 {v.clarity_confidence}）"
+    )
     console.print(head)
     if brief is not None:
         _print_brief(brief, cached)
     if isinstance(result, Trade):
-        console.print(f"  [green]TRADE[/] BUY {result.outcome} {result.size} @ {result.price} (${result.usd:.2f}) edge {result.edge:+.2f}")
+        console.print(
+            f"  [green]交易信号[/] 买入 {_outcome_cn(result.outcome)} "
+            f"{result.size} 份 @ {result.price}（${result.usd:.2f}） 优势 {result.edge:+.2f}"
+        )
     else:
-        console.print(f"  [dim]skip: {result.reason}[/]")
+        console.print(f"  [dim]跳过：{result.reason}[/]")
 
 
 def _decision_row(c: Candidate, state: dict, v, result, brief: Brief | None, executed: bool) -> dict:
