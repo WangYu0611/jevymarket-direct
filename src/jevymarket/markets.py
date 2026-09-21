@@ -19,8 +19,12 @@ log = logging.getLogger(__name__)
 
 ASSET_ALIASES: dict[str, set[str]] = {
     "BTC": {"bitcoin", "btc"},
-    "ETH": {"ethereum", "ether", "eth"},
-    "SOL": {"solana", "sol"},
+}
+
+TIMEFRAME_LABELS = {
+    "5m": "5分钟",
+    "15m": "15分钟",
+    "1h": "1小时",
 }
 
 
@@ -30,6 +34,35 @@ def _allowed_asset_symbols(s: Settings) -> tuple[str, ...]:
         for raw in s.allowed_assets.split(",")
         if (symbol := raw.strip().upper())
     )
+
+
+def _allowed_timeframes(s: Settings) -> tuple[str, ...]:
+    return tuple(
+        timeframe
+        for raw in s.allowed_timeframes.split(",")
+        if (timeframe := raw.strip().lower())
+    )
+
+
+def market_timeframe(m: Market, s: Settings) -> str | None:
+    """识别支持的 BTC 短周期涨跌市场。"""
+    slug = (m.slug or "").lower()
+    desc = (m.description or "").lower()
+
+    if slug.startswith("btc-updown-5m-"):
+        timeframe = "5m"
+    elif slug.startswith("btc-updown-15m-"):
+        timeframe = "15m"
+    elif slug.startswith("btc-updown-1h-"):
+        timeframe = "1h"
+    elif slug.startswith("bitcoin-up-or-down-") and (
+        "1 hour candle" in desc or '"1h" candle' in desc or "relevant 1h candle" in desc
+    ):
+        timeframe = "1h"
+    else:
+        return None
+
+    return timeframe if timeframe in _allowed_timeframes(s) else None
 
 
 def market_asset_symbol(m: Market, s: Settings) -> str | None:
