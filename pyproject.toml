@@ -34,7 +34,7 @@ Repository = "https://github.com/WangYu0611/jevymarket-direct"
 Issues = "https://github.com/WangYu0611/jevymarket-direct/issues"
 
 [project.scripts]
-jevymarket = "jevymarket.cli:app"
+jevymarket = "jevymarket.fast_cli:app"
 
 [dependency-groups]
 dev = [
