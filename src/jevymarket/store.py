@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +18,8 @@ CREATE TABLE IF NOT EXISTS decisions (
     question TEXT,
     state_json TEXT,
     p_yes REAL,
+    jev_p_yes REAL,
+    timeframe TEXT,
     answerable REAL,
     clarity INTEGER,
     yes_ask REAL,
@@ -77,6 +80,19 @@ CREATE TABLE IF NOT EXISTS price_samples (
 );
 CREATE INDEX IF NOT EXISTS idx_price_samples_lookup
 ON price_samples(source, twap_window, ts);
+CREATE TABLE IF NOT EXISTS market_results (
+    slug TEXT PRIMARY KEY,
+    condition_id TEXT,
+    timeframe TEXT,
+    resolved_ts REAL NOT NULL,
+    winner TEXT NOT NULL,
+    up_won INTEGER NOT NULL,
+    up_final_price REAL,
+    down_final_price REAL,
+    source TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_market_results_timeframe
+ON market_results(timeframe, resolved_ts);
 """
 
 
@@ -92,6 +108,10 @@ class Store:
         cols = {r["name"] for r in self.conn.execute("PRAGMA table_info(decisions)")}
         if "research_cost" not in cols:
             self.conn.execute("ALTER TABLE decisions ADD COLUMN research_cost REAL")
+        if "jev_p_yes" not in cols:
+            self.conn.execute("ALTER TABLE decisions ADD COLUMN jev_p_yes REAL")
+        if "timeframe" not in cols:
+            self.conn.execute("ALTER TABLE decisions ADD COLUMN timeframe TEXT")
 
         anchor_info = self.conn.execute("PRAGMA table_info(price_anchors)").fetchall()
         pk_cols = [r["name"] for r in sorted(anchor_info, key=lambda row: row["pk"]) if r["pk"]]
@@ -117,7 +137,45 @@ class Store:
                 ON price_anchors(window_start);
                 """
             )
+        self._backfill_decision_metadata()
         self.conn.commit()
+
+    def _backfill_decision_metadata(self) -> None:
+        rows = self.conn.execute(
+            """
+            SELECT id, state_json, raw_json, jev_p_yes, timeframe
+            FROM decisions
+            WHERE jev_p_yes IS NULL OR timeframe IS NULL
+            """
+        ).fetchall()
+        for row in rows:
+            state: dict[str, Any] = {}
+            raw: dict[str, Any] = {}
+            try:
+                state = json.loads(row["state_json"] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                pass
+            try:
+                raw = json.loads(row["raw_json"] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                pass
+
+            timeframe = row["timeframe"] or state.get("timeframe")
+            jev_p = row["jev_p_yes"]
+            if jev_p is None:
+                answers = raw.get("answers") if isinstance(raw, dict) else None
+                answer = answers.get("resolves_yes") if isinstance(answers, dict) else None
+                if isinstance(answer, dict):
+                    for key in ("noul", "probability", "p", "value"):
+                        value = answer.get(key)
+                        if isinstance(value, (int, float)) and not isinstance(value, bool):
+                            jev_p = float(value)
+                            break
+
+            self.conn.execute(
+                "UPDATE decisions SET jev_p_yes = ?, timeframe = ? WHERE id = ?",
+                (jev_p, timeframe, row["id"]),
+            )
 
     def close(self) -> None:
         self.conn.close()
@@ -227,6 +285,90 @@ class Store:
         self.conn.commit()
         return int(cur.rowcount)
 
+    # --- settlement / evaluation -----------------------------------------------
+
+    def put_market_result(
+        self,
+        *,
+        slug: str,
+        condition_id: str | None,
+        timeframe: str | None,
+        winner: str,
+        up_won: bool,
+        up_final_price: float | None,
+        down_final_price: float | None,
+        source: str,
+        resolved_ts: float | None = None,
+    ) -> bool:
+        cur = self.conn.execute(
+            """
+            INSERT OR IGNORE INTO market_results
+            (slug, condition_id, timeframe, resolved_ts, winner, up_won,
+             up_final_price, down_final_price, source)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                slug,
+                condition_id,
+                timeframe,
+                resolved_ts or time.time(),
+                winner,
+                int(up_won),
+                up_final_price,
+                down_final_price,
+                source,
+            ),
+        )
+        self.conn.commit()
+        return cur.rowcount > 0
+
+    def get_market_result(self, slug: str) -> dict | None:
+        row = self.conn.execute(
+            "SELECT * FROM market_results WHERE slug = ?",
+            (slug,),
+        ).fetchone()
+        return dict(row) if row is not None else None
+
+    def pending_short_market_slugs(
+        self,
+        *,
+        now_ts: float | None = None,
+        grace_seconds: float = 30.0,
+        limit: int = 200,
+    ) -> list[str]:
+        cutoff = (now_ts or time.time()) - grace_seconds
+        rows = self.conn.execute(
+            """
+            SELECT slug, MAX(ts) AS last_ts, state_json
+            FROM decisions
+            WHERE slug NOT IN (SELECT slug FROM market_results)
+            GROUP BY slug
+            ORDER BY last_ts DESC
+            LIMIT ?
+            """,
+            (limit * 3,),
+        ).fetchall()
+        pending: list[str] = []
+        for row in rows:
+            try:
+                state = json.loads(row["state_json"] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if state.get("timeframe") not in {"5m", "15m", "1h"}:
+                continue
+            end = state.get("market_end_time")
+            if not isinstance(end, str):
+                continue
+            try:
+                end_ts = datetime.fromisoformat(end.replace("Z", "+00:00")).timestamp()
+            except ValueError:
+                continue
+            if end_ts <= cutoff:
+                pending.append(str(row["slug"]))
+                if len(pending) >= limit:
+                    break
+        return pending
+
     # --- research cache ------------------------------------------------------
 
     def get_brief(self, slug: str, max_age_s: float) -> dict | None:
@@ -262,26 +404,145 @@ class Store:
     def stats(self) -> dict[str, Any]:
         c = self.conn
         n_dec = c.execute("SELECT COUNT(*) FROM decisions").fetchone()[0]
-        n_trade = c.execute("SELECT COUNT(*) FROM decisions WHERE action = 'trade'").fetchone()[0]
-        cost = c.execute("SELECT COALESCE(SUM(jev_cost),0) FROM decisions").fetchone()[0]
-        n_orders = c.execute("SELECT COUNT(*) FROM orders WHERE dry_run = 0").fetchone()[0]
+        n_trade = c.execute(
+            "SELECT COUNT(*) FROM decisions WHERE action LIKE 'trade%'"
+        ).fetchone()[0]
+        n_orders = c.execute(
+            "SELECT COUNT(*) FROM orders WHERE dry_run = 0"
+        ).fetchone()[0]
+        n_dry_orders = c.execute(
+            "SELECT COUNT(*) FROM orders WHERE dry_run = 1 AND status = 'dry_run'"
+        ).fetchone()[0]
+        n_results = c.execute("SELECT COUNT(*) FROM market_results").fetchone()[0]
         n_briefs = c.execute("SELECT COUNT(*) FROM research").fetchone()[0]
-        rcost = c.execute("SELECT COALESCE(SUM(cost),0) FROM research").fetchone()[0]
-        usd = c.execute("SELECT COALESCE(SUM(usd),0) FROM orders WHERE dry_run = 0 AND status NOT IN ('failed','rejected')").fetchone()[0]
+        usd = c.execute(
+            """
+            SELECT COALESCE(SUM(usd),0) FROM orders
+            WHERE dry_run = 0 AND status NOT IN ('failed','rejected')
+            """
+        ).fetchone()[0]
+
         buckets = c.execute(
             """
-            SELECT CAST(p_yes*10 AS INT) AS b, COUNT(*) AS n, AVG(p_yes) AS avg_p, AVG(midpoint) AS avg_mkt
-            FROM decisions WHERE p_yes IS NOT NULL AND midpoint IS NOT NULL
+            SELECT CAST(p_yes*10 AS INT) AS b, COUNT(*) AS n,
+                   AVG(p_yes) AS avg_p, AVG(midpoint) AS avg_mkt
+            FROM decisions
+            WHERE p_yes IS NOT NULL AND midpoint IS NOT NULL
             GROUP BY b ORDER BY b
             """
         ).fetchall()
+
         return {
             "decisions": n_dec,
             "trade_signals": n_trade,
-            "jev_cost_usd": cost,
             "briefs": n_briefs,
-            "research_cost_usd": rcost,
             "live_orders": n_orders,
+            "dry_orders": n_dry_orders,
+            "resolved_markets": n_results,
             "live_usd": usd,
             "buckets": [dict(r) for r in buckets],
+            "model_comparison": self.model_comparison(),
+            "dry_run_performance": self.dry_run_performance(),
+        }
+
+    @staticmethod
+    def _brier(values: list[tuple[float, int]]) -> float | None:
+        if not values:
+            return None
+        return sum((p - y) ** 2 for p, y in values) / len(values)
+
+    @staticmethod
+    def _log_loss(values: list[tuple[float, int]]) -> float | None:
+        if not values:
+            return None
+        import math
+
+        eps = 1e-6
+        total = 0.0
+        for p, y in values:
+            p = min(1 - eps, max(eps, p))
+            total -= y * math.log(p) + (1 - y) * math.log(1 - p)
+        return total / len(values)
+
+    @staticmethod
+    def _direction_accuracy(values: list[tuple[float, int]]) -> float | None:
+        if not values:
+            return None
+        return sum((p >= 0.5) == bool(y) for p, y in values) / len(values)
+
+    def model_comparison(self) -> list[dict[str, Any]]:
+        rows = self.conn.execute(
+            """
+            SELECT d.id, d.state_json, d.jev_p_yes, d.midpoint,
+                   d.timeframe, r.up_won
+            FROM decisions d
+            JOIN market_results r ON r.slug = d.slug
+            ORDER BY d.ts
+            """
+        ).fetchall()
+
+        by_model: dict[str, list[tuple[float, int]]] = {
+            "量化 Φ(Z)": [],
+            "Jev": [],
+            "Polymarket": [],
+        }
+        for row in rows:
+            y = int(row["up_won"])
+            try:
+                state = json.loads(row["state_json"] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                state = {}
+            quant = state.get("quantitative_signal")
+            p_quant = quant.get("p_up") if isinstance(quant, dict) else None
+            if isinstance(p_quant, (int, float)):
+                by_model["量化 Φ(Z)"].append((float(p_quant), y))
+            if isinstance(row["jev_p_yes"], (int, float)):
+                by_model["Jev"].append((float(row["jev_p_yes"]), y))
+            if isinstance(row["midpoint"], (int, float)):
+                by_model["Polymarket"].append((float(row["midpoint"]), y))
+
+        out = []
+        for name, values in by_model.items():
+            out.append({
+                "model": name,
+                "n": len(values),
+                "brier": self._brier(values),
+                "log_loss": self._log_loss(values),
+                "accuracy": self._direction_accuracy(values),
+            })
+        return out
+
+    def dry_run_performance(self) -> dict[str, Any]:
+        rows = self.conn.execute(
+            """
+            SELECT o.slug, o.outcome, o.price, o.size, o.usd,
+                   r.winner, r.up_won
+            FROM orders o
+            JOIN market_results r ON r.slug = o.slug
+            WHERE o.dry_run = 1 AND o.status = 'dry_run'
+            ORDER BY o.ts
+            """
+        ).fetchall()
+
+        pnl = 0.0
+        wins = 0
+        stake = 0.0
+        for row in rows:
+            won = str(row["outcome"]).upper() == str(row["winner"]).upper()
+            usd = float(row["usd"] or 0)
+            size = float(row["size"] or 0)
+            stake += usd
+            if won:
+                wins += 1
+                pnl += size - usd
+            else:
+                pnl -= usd
+
+        return {
+            "trades": len(rows),
+            "wins": wins,
+            "hit_rate": (wins / len(rows)) if rows else None,
+            "stake_usd": stake,
+            "pnl_usd": pnl,
+            "roi": (pnl / stake) if stake > 0 else None,
         }
