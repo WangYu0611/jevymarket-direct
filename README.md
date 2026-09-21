@@ -1,6 +1,7 @@
 # jevymarket-direct
 
-A Polymarket trading bot whose pricing oracle is **Jev / TypeSafe System One**. This repository is
+A Polymarket trading bot whose pricing oracle is **Jev / TypeSafe System One**. This fork is now
+focused on **Bitcoin Up/Down short-term markets only: 5 minutes, 15 minutes, and 1 hour**. It is
 derived from [markusbug/jevymarket](https://github.com/markusbug/jevymarket), but removes OpenRouter
 from the model path.
 
@@ -68,6 +69,22 @@ uv run jevymarket stats
 
 The upstream `run` command is live by default. Use `--dry-run` until both provider calls and the
 strategy output have been checked with your own credentials.
+
+## Trading scope
+
+The scanner only accepts BTC directional recurring markets matching the 5m, 15m, or 1h patterns.
+ETH, SOL, 4h, daily target, and monthly target markets are ignored before model calls.
+
+~~~dotenv
+ALLOWED_ASSETS=BTC
+ALLOWED_TIMEFRAMES=5m,15m,1h
+SHORT_TERM_MIN_LIQUIDITY_USD=0
+SHORT_TERM_MIN_VOLUME_USD=0
+~~~
+
+The 5m and 15m markets resolve from Chainlink BTC/USD TWAP; the hourly market resolves from the
+Binance BTC/USDT 1H candle. The short-term strategy therefore still needs a dedicated real-time
+market-data layer before serious live trading.
 
 ## Provider configuration
 
