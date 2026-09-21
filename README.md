@@ -5,8 +5,9 @@ derived from [markusbug/jevymarket](https://github.com/markusbug/jevymarket), bu
 from the model path.
 
 - **Jev** is called directly through TypeSafe's official `POST /v1/systemone` API.
-- **Research** is done through DeepSeek's official Anthropic-compatible Messages API using its native
-  `web_search_20250305` server tool.
+- **Research** is done in two DeepSeek-official stages: Anthropic-compatible Messages + native
+  `web_search_20250305` for current facts, then OpenAI-compatible Chat Completions JSON mode to
+  normalize the verified memo into the strict `Brief` schema.
 - Market scanning, signal gates, Kelly sizing, exposure caps, execution, caching, and SQLite logging
   retain the upstream design.
 
@@ -16,7 +17,7 @@ from the model path.
 ## Decision pipeline
 
 ~~~
-scan -> DeepSeek web research -> compact evidence -> Jev -> evaluate -> execute -> SQLite
+scan -> DeepSeek web search -> DeepSeek JSON normalize -> compact evidence -> Jev -> evaluate -> execute -> SQLite
 ~~~
 
 DeepSeek gathers dated, sourced facts and is instructed not to estimate a probability or use
@@ -76,7 +77,8 @@ strategy output have been checked with your own credentials.
 | `TYPESAFE_BASE_URL` | `https://api.typesafe.ai/v1` | TypeSafe official API base |
 | `JEV_MODEL` | `jev-latest` | Jev model/version |
 | `DEEPSEEK_API_KEY` | — | DeepSeek official credential |
-| `DEEPSEEK_BASE_URL` | `https://api.deepseek.com/anthropic/v1` | DeepSeek Messages API base |
+| `DEEPSEEK_BASE_URL` | `https://api.deepseek.com/anthropic/v1` | DeepSeek Messages/web-search API base |
+| `DEEPSEEK_JSON_BASE_URL` | `https://api.deepseek.com` | DeepSeek Chat Completions JSON-mode base |
 | `RESEARCH_MODEL` | `deepseek-v4-pro` | researcher model |
 | `RESEARCH_MAX_SEARCHES` | `5` | native web-search uses per research call |
 | `RESEARCH_TTL_HOURS` | `6` | cached brief lifetime |
