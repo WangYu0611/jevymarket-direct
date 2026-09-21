@@ -519,8 +519,18 @@ def stats():
     console.print(
         f"决策数={st['decisions']} 交易信号={st['trade_signals']} "
         f"已结算市场={st['resolved_markets']} 模拟订单={st['dry_orders']} "
+        f"固定checkpoint样本={st['evaluation_samples']} "
         f"真实订单={st['live_orders']} 真实金额=${st['live_usd']:.2f}"
     )
+    if st["strategy_versions"]:
+        console.print(
+            "[dim]策略版本："
+            + "；".join(
+                f"{row['strategy_version']}={row['n']}"
+                for row in st["strategy_versions"]
+            )
+            + "[/]"
+        )
 
     t = Table(title="概率模型对比（只统计已有官方结算结果的决策快照）")
     for col in ("周期", "模型", "样本", "Brier↓", "LogLoss↓", "方向命中率"):
@@ -643,6 +653,10 @@ def _fmt_num(value: float | None, digits: int = 2) -> str:
 
 def _fmt_metric(value: float | None, digits: int = 4) -> str:
     return "—" if value is None else f"{value:.{digits}f}"
+
+
+def _fmt_plain(value: float | None, digits: int = 1) -> str:
+    return "—" if value is None else f"{value:,.{digits}f}"
 
 
 def _fmt_percent(value: float | None) -> str:
@@ -806,6 +820,15 @@ def _print_decision(
         f"规则清晰度={v.clarity_mean}（置信度 {v.clarity_confidence}）"
     )
     console.print(head)
+    console.print(
+        "  盘口结构："
+        f"spread={_fmt_num(c.book.spread, 3)}；"
+        f"5¢方向imbalance={_fmt_num(c.book.directional_imbalance_5c, 3)}；"
+        f"Up bid/ask深度=${_fmt_plain(c.book.yes_bid_depth_5c_usd)}/"
+        f"${_fmt_plain(c.book.yes_ask_depth_5c_usd)}；"
+        f"Down bid/ask深度=${_fmt_plain(c.book.no_bid_depth_5c_usd)}/"
+        f"${_fmt_plain(c.book.no_ask_depth_5c_usd)}"
+    )
     if snapshot is not None:
         _print_snapshot(snapshot)
     if brief is not None:
