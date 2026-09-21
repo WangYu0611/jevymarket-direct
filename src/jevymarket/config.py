@@ -20,6 +20,8 @@ class Settings(BaseSettings):
     # --- Jev (TypeSafe official API) --------------------------------------
     jev_model: str = "jev-latest"
     typesafe_base_url: str = "https://api.typesafe.ai/v1"
+    jev_timeout_seconds: float = 30.0
+    jev_max_retries: int = 2
 
     # --- researcher (DeepSeek official API + native web search) -----------
     research_enabled: bool = True
