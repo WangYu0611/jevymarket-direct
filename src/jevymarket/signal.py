@@ -35,14 +35,21 @@ QUESTIONS = {
     "resolves_yes": noul(
         "Estimate the probability that the FIRST listed market outcome, provided as "
         "`primary_outcome` in state, will win. For these BTC short-term markets this is UP. "
-        "Use `short_term_market_data` as the primary evidence: authoritative target/open "
-        "price, current reference price, price delta, percent delta, seconds remaining, and "
-        "the market's resolution rules. Do not infer probability from prediction-market odds."
+        "Use `short_term_market_data` as the primary evidence. It contains the authoritative "
+        "target/open price, current reference price, distance from target, seconds remaining, "
+        "and `path_features`: recent 30s/60s/180s/300s returns, realized volatility, recent "
+        "price range, up-tick ratio, trend slope, expected remaining volatility, and "
+        "`distance_z` (signed log-distance from the target divided by estimated volatility "
+        "over the remaining time). Treat positive distance_z as price above the target and "
+        "negative distance_z as below it. Use momentum as context, not as certainty. Do not "
+        "infer probability from prediction-market odds; those odds are intentionally absent."
     ),
     "answerable": noul(
-        "The authoritative `short_term_market_data` and resolution rules contain enough "
-        "current information to form a probability estimate. Answer NO if target/open price, "
-        "current reference price, remaining time, or the relevant source data is missing/stale."
+        "The authoritative short-term data contain enough current information to form a "
+        "well-informed probability estimate. Give high answerability only when target/open "
+        "price, current reference price, seconds remaining, and `path_features.feature_ready` "
+        "are present, with recent non-stale history and at least short-term volatility/momentum "
+        "coverage. Missing or stale path history should materially reduce answerability."
     ),
     "clarity": score(
         "How clear and objective are the resolution criteria for this market?",
