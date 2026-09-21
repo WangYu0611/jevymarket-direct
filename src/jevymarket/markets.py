@@ -244,37 +244,69 @@ async def fetch_book(client: AsyncPublicClient, m: Market) -> Book:
     return book_from_orderbooks(m, books)
 
 
+def current_market_slugs(s: Settings, now: datetime | None = None) -> list[str]:
+    """根据当前 UTC 时间直接构造 BTC 5m / 15m / 1h 市场 slug。"""
+    current = now or datetime.now(UTC)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=UTC)
+    else:
+        current = current.astimezone(UTC)
+
+    slugs: list[str] = []
+    allowed = _allowed_timeframes(s)
+
+    if "5m" in allowed:
+        start = int(current.timestamp()) // 300 * 300
+        slugs.append(f"btc-updown-5m-{start}")
+
+    if "15m" in allowed:
+        start = int(current.timestamp()) // 900 * 900
+        slugs.append(f"btc-updown-15m-{start}")
+
+    if "1h" in allowed:
+        eastern = current.astimezone(ZoneInfo("America/New_York"))
+        hour = eastern.hour % 12 or 12
+        ampm = "am" if eastern.hour < 12 else "pm"
+        month = eastern.strftime("%B").lower()
+        slugs.append(
+            f"bitcoin-up-or-down-{month}-{eastern.day}-{eastern.year}-{hour}{ampm}-et"
+        )
+
+    return slugs
+
+
 async def scan(client: AsyncPublicClient, s: Settings, limit: int = 20, pages: int = 5) -> list[Candidate]:
-    """Walk the most-traded open markets and keep those passing filters + a live book."""
+    """直接加载当前 BTC 5m / 15m / 1h 窗口，不分页扫描未来 recurring markets。"""
+    del pages  # 保留 CLI 兼容性；当前窗口模式不再需要分页。
     out: list[Candidate] = []
     now = datetime.now(UTC)
-    paginator = client.list_markets(
-        closed=False,
-        order="startDate",
-        ascending=False,
-        page_size=100,
-    )
-    seen_pages = 0
-    async for page in paginator:
-        seen_pages += 1
-        for m in page.items:
-            why = passes_static_filters(m, s, now=now)
-            if why:
-                log.debug("skip %s: %s", m.slug, why)
-                continue
-            try:
-                book = await fetch_book(client, m)
-            except Exception as e:  # noqa: BLE001
-                log.warning("book fetch failed for %s: %s", m.slug, e)
-                continue
-            if book.spread is not None and book.spread > s.max_spread:
-                log.debug("skip %s: live spread %.2f", m.slug, book.spread)
-                continue
-            out.append(Candidate(market=m, book=book))
-            if len(out) >= limit:
-                return out
-        if seen_pages >= pages:
+
+    for slug in current_market_slugs(s, now):
+        try:
+            m = await client.get_market(slug=slug)
+        except Exception as e:  # noqa: BLE001
+            log.debug("当前市场 %s 尚不可用：%s", slug, e)
+            continue
+
+        why = passes_static_filters(m, s, now=now)
+        if why:
+            log.debug("跳过 %s：%s", m.slug, why)
+            continue
+
+        try:
+            book = await fetch_book(client, m)
+        except Exception as e:  # noqa: BLE001
+            log.warning("获取盘口失败 %s：%s", m.slug, e)
+            continue
+
+        if book.spread is not None and book.spread > s.max_spread:
+            log.debug("跳过 %s：实时点差 %.2f", m.slug, book.spread)
+            continue
+
+        out.append(Candidate(market=m, book=book))
+        if len(out) >= limit:
             break
+
     return out
 
 
