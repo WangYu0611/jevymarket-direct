@@ -652,7 +652,14 @@ class Store:
         pnl = 0.0
         wins = 0
         stake = 0.0
+        seen_slugs: set[str] = set()
+        counted = 0
         for row in rows:
+            slug = str(row["slug"])
+            if slug in seen_slugs:
+                continue
+            seen_slugs.add(slug)
+            counted += 1
             won = str(row["outcome"]).upper() == str(row["winner"]).upper()
             usd = float(row["usd"] or 0)
             size = float(row["size"] or 0)
@@ -664,9 +671,9 @@ class Store:
                 pnl -= usd
 
         return {
-            "trades": len(rows),
+            "trades": counted,
             "wins": wins,
-            "hit_rate": (wins / len(rows)) if rows else None,
+            "hit_rate": (wins / counted) if counted else None,
             "stake_usd": stake,
             "pnl_usd": pnl,
             "roi": (pnl / stake) if stake > 0 else None,
