@@ -316,6 +316,17 @@ def _window_points(
     return [(ts, price) for ts, price in points if cutoff <= ts <= end_ts]
 
 
+def _median_interval(points: list[tuple[float, float]]) -> float | None:
+    if len(points) < 2:
+        return None
+    gaps = [
+        points[i][0] - points[i - 1][0]
+        for i in range(1, len(points))
+        if points[i][0] > points[i - 1][0]
+    ]
+    return statistics.median(gaps) if gaps else None
+
+
 def _return_pct(
     points: list[tuple[float, float]],
     end_ts: float,
@@ -323,10 +334,17 @@ def _return_pct(
 ) -> float | None:
     if not points:
         return None
+    cadence = _median_interval(points)
+    if cadence is not None and cadence > window_seconds * 0.8:
+        # Do not fabricate a sub-cadence return from coarse bars.
+        return None
+    tolerance = 5.0
+    if cadence is not None:
+        tolerance = max(5.0, min(35.0, cadence * 0.6))
     start_price = _nearest_price(
         points,
         end_ts - window_seconds,
-        tolerance_seconds=5.0 if window_seconds <= 300 else 10.0,
+        tolerance_seconds=tolerance,
     )
     end_price = points[-1][1]
     if start_price is None or start_price <= 0:
@@ -441,12 +459,21 @@ def compute_path_features(
         seconds_left=seconds_left,
     )
 
+    rv60 = _realized_vol_pct(w60)
+    rv180 = _realized_vol_pct(w180)
+    rv300 = _realized_vol_pct(w300)
+    cadence = _median_interval(points)
+    if cadence is not None and cadence <= 5:
+        volatility_ready = rv60 is not None
+    else:
+        volatility_ready = rv300 is not None or rv180 is not None
+
     feature_ready = (
         len(points) >= 4
         and history_span >= min_history_seconds
         and latest_age is not None
         and latest_age <= max_sample_age_seconds
-        and _realized_vol_pct(w60) is not None
+        and volatility_ready
     )
 
     return PricePathFeatures(
@@ -458,9 +485,9 @@ def compute_path_features(
         return_60s_pct=_return_pct(points, end_ts, 60),
         return_180s_pct=_return_pct(points, end_ts, 180),
         return_300s_pct=_return_pct(points, end_ts, 300),
-        realized_vol_60s_pct=_realized_vol_pct(w60),
-        realized_vol_180s_pct=_realized_vol_pct(w180),
-        realized_vol_300s_pct=_realized_vol_pct(w300),
+        realized_vol_60s_pct=rv60,
+        realized_vol_180s_pct=rv180,
+        realized_vol_300s_pct=rv300,
         range_60s_pct=_range_pct(w60),
         range_180s_pct=_range_pct(w180),
         range_300s_pct=_range_pct(w300),
