@@ -143,28 +143,34 @@ def book_from_orderbooks(market: Market, books: list[OrderBook] | tuple[OrderBoo
         no_ask=_best(nb.asks, min) if nb else None,
         tick_size=float(ref.tick_size) if ref and ref.tick_size else float(market.trading.minimum_tick_size or 0.01),
         min_order_size=float(ref.min_order_size) if ref and ref.min_order_size else float(market.trading.minimum_order_size or 5),
+        yes_label=str(market.outcomes.yes.label or "UP"),
+        no_label=str(market.outcomes.no.label or "DOWN"),
     )
 
 
 def passes_static_filters(m: Market, s: Settings) -> str | None:
     """Return a skip reason, or None if the market is a candidate."""
     st = m.state
-    if s.allowed_assets and market_asset_symbol(m, s) is None:
-        return f"asset not in whitelist [{s.allowed_assets}]"
+    if market_asset_symbol(m, s) != "BTC":
+        return "不是 BTC 市场"
+    timeframe = market_timeframe(m, s)
+    if timeframe is None:
+        return f"不是允许的 BTC 短周期市场 [{s.allowed_timeframes}]"
     if not (st.active and st.accepting_orders) or st.closed or st.archived:
         return "not tradable"
     if not st.enable_order_book:
         return "no CLOB order book"
     if not (m.outcomes and m.outcomes.yes and m.outcomes.no and m.outcomes.yes.token_id and m.outcomes.no.token_id):
-        return "missing yes/no tokens"
-    if (m.outcomes.yes.label or "").strip().lower() != "yes":
-        return f"outcome labels are {m.outcomes.yes.label}/{m.outcomes.no.label}, not Yes/No"
+        return "缺少两个方向的交易 token"
+    labels = ((m.outcomes.yes.label or "").strip().lower(), (m.outcomes.no.label or "").strip().lower())
+    if labels != ("up", "down"):
+        return f"结果标签不是 Up/Down，而是 {m.outcomes.yes.label}/{m.outcomes.no.label}"
     liq = _f(m.metrics.liquidity_num) or 0.0
     vol = _f(m.metrics.volume_num) or 0.0
-    if liq < s.min_liquidity_usd:
-        return f"liquidity ${liq:,.0f} < ${s.min_liquidity_usd:,.0f}"
-    if vol < s.min_volume_usd:
-        return f"volume ${vol:,.0f} < ${s.min_volume_usd:,.0f}"
+    if liq < s.short_term_min_liquidity_usd:
+        return f"流动性 ${liq:,.0f} < ${s.short_term_min_liquidity_usd:,.0f}"
+    if vol < s.short_term_min_volume_usd:
+        return f"成交量 ${vol:,.0f} < ${s.short_term_min_volume_usd:,.0f}"
     days = _days_until(st.end_date)
     if days is None:
         return "no end date"
@@ -191,11 +197,9 @@ async def scan(client: AsyncPublicClient, s: Settings, limit: int = 20, pages: i
     out: list[Candidate] = []
     paginator = client.list_markets(
         closed=False,
-        order="volume24hr",
+        order="startDate",
         ascending=False,
-        liquidity_num_min=s.min_liquidity_usd,
-        volume_num_min=s.min_volume_usd,
-        page_size=50,
+        page_size=100,
     )
     seen_pages = 0
     async for page in paginator:
@@ -228,9 +232,12 @@ async def load_candidate(client: AsyncPublicClient, s: Settings, ref: str) -> Ca
     else:
         m = await client.get_market(slug=ref)
     if not (m.outcomes and m.outcomes.yes and m.outcomes.no):
-        raise ValueError(f"{m.slug} is not a binary market")
-    if s.allowed_assets and market_asset_symbol(m, s) is None:
-        raise ValueError(f"{m.slug} is not for an allowed asset [{s.allowed_assets}]")
+        raise ValueError(f"{m.slug} 不是二元市场")
+    if market_asset_symbol(m, s) != "BTC" or market_timeframe(m, s) is None:
+        raise ValueError(f"{m.slug} 不是允许的 BTC 5分钟/15分钟/1小时涨跌市场")
+    labels = ((m.outcomes.yes.label or "").strip().lower(), (m.outcomes.no.label or "").strip().lower())
+    if labels != ("up", "down"):
+        raise ValueError(f"{m.slug} 的结果不是 Up/Down")
     return Candidate(market=m, book=await fetch_book(client, m))
 
 
@@ -246,6 +253,9 @@ def build_state(c: Candidate, s: Settings, brief: Brief | None = None) -> dict:
         "description": desc,
         "today": datetime.now(UTC).date().isoformat(),
         "days_until_resolution": c.days_to_resolution,
+        "primary_outcome": str(m.outcomes.yes.label or "Up"),
+        "secondary_outcome": str(m.outcomes.no.label or "Down"),
+        "timeframe": market_timeframe(m, s),
     }
     if m.state.start_date:
         state["market_start_date"] = m.state.start_date.date().isoformat()
@@ -253,7 +263,7 @@ def build_state(c: Candidate, s: Settings, brief: Brief | None = None) -> dict:
         state["resolution_source"] = m.resolution.source
     mid = c.book.midpoint
     if mid is not None:
-        state["market_implied_probability_yes"] = round(mid, 2)
+        state["market_implied_probability_primary"] = round(mid, 2)
     if brief is not None:
         state["evidence"] = brief.to_state(s.research_max_chars)
     return state
