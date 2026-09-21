@@ -68,6 +68,15 @@ CREATE TABLE IF NOT EXISTS price_anchors (
     PRIMARY KEY (slug, twap_window)
 );
 CREATE INDEX IF NOT EXISTS idx_price_anchors_start ON price_anchors(window_start);
+CREATE TABLE IF NOT EXISTS price_samples (
+    source TEXT NOT NULL,
+    twap_window INTEGER NOT NULL DEFAULT 0,
+    ts INTEGER NOT NULL,
+    price REAL NOT NULL,
+    PRIMARY KEY (source, twap_window, ts)
+);
+CREATE INDEX IF NOT EXISTS idx_price_samples_lookup
+ON price_samples(source, twap_window, ts);
 """
 
 
@@ -168,6 +177,55 @@ class Store:
             (slug, twap_window),
         ).fetchone()
         return dict(row) if row is not None else None
+
+    # --- realtime price history ------------------------------------------------
+
+    def put_price_sample(
+        self,
+        *,
+        source: str,
+        price: float,
+        observed_ts: float,
+        twap_window: int = 0,
+    ) -> None:
+        """Store one sample per second; later updates in the same second replace earlier ones."""
+        self.conn.execute(
+            """
+            INSERT INTO price_samples (source, twap_window, ts, price)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(source, twap_window, ts)
+            DO UPDATE SET price = excluded.price
+            """,
+            (source, int(twap_window), int(observed_ts), float(price)),
+        )
+        self.conn.commit()
+
+    def get_price_samples(
+        self,
+        *,
+        source: str,
+        since_ts: float,
+        twap_window: int = 0,
+        until_ts: float | None = None,
+    ) -> list[dict]:
+        q = (
+            "SELECT ts, price FROM price_samples "
+            "WHERE source = ? AND twap_window = ? AND ts >= ?"
+        )
+        params: list[Any] = [source, int(twap_window), int(since_ts)]
+        if until_ts is not None:
+            q += " AND ts <= ?"
+            params.append(int(until_ts))
+        q += " ORDER BY ts"
+        return [dict(row) for row in self.conn.execute(q, tuple(params)).fetchall()]
+
+    def prune_price_samples(self, before_ts: float) -> int:
+        cur = self.conn.execute(
+            "DELETE FROM price_samples WHERE ts < ?",
+            (int(before_ts),),
+        )
+        self.conn.commit()
+        return int(cur.rowcount)
 
     # --- research cache ------------------------------------------------------
 
