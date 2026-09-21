@@ -105,6 +105,8 @@ CREATE TABLE IF NOT EXISTS evaluation_samples (
     seconds_left INTEGER NOT NULL,
     quant_p REAL,
     jev_p REAL,
+    jev_answerable REAL,
+    jev_clarity INTEGER,
     market_p REAL,
     yes_ask REAL,
     no_ask REAL,
@@ -136,6 +138,18 @@ class Store:
         if "strategy_version" not in cols:
             self.conn.execute("ALTER TABLE decisions ADD COLUMN strategy_version TEXT")
 
+        eval_cols = {
+            r["name"] for r in self.conn.execute("PRAGMA table_info(evaluation_samples)")
+        }
+        if eval_cols and "jev_answerable" not in eval_cols:
+            self.conn.execute(
+                "ALTER TABLE evaluation_samples ADD COLUMN jev_answerable REAL"
+            )
+        if eval_cols and "jev_clarity" not in eval_cols:
+            self.conn.execute(
+                "ALTER TABLE evaluation_samples ADD COLUMN jev_clarity INTEGER"
+            )
+
         anchor_info = self.conn.execute("PRAGMA table_info(price_anchors)").fetchall()
         pk_cols = [r["name"] for r in sorted(anchor_info, key=lambda row: row["pk"]) if r["pk"]]
         if anchor_info and pk_cols == ["slug"]:
@@ -161,6 +175,7 @@ class Store:
                 """
             )
         self._backfill_decision_metadata()
+        self._backfill_evaluation_gate_metadata()
         self.conn.commit()
 
     def _backfill_decision_metadata(self) -> None:
@@ -198,6 +213,38 @@ class Store:
             self.conn.execute(
                 "UPDATE decisions SET jev_p_yes = ?, timeframe = ? WHERE id = ?",
                 (jev_p, timeframe, row["id"]),
+            )
+
+    def _backfill_evaluation_gate_metadata(self) -> None:
+        rows = self.conn.execute(
+            """
+            SELECT id, slug, ts
+            FROM evaluation_samples
+            WHERE jev_answerable IS NULL OR jev_clarity IS NULL
+            """
+        ).fetchall()
+        for row in rows:
+            decision = self.conn.execute(
+                """
+                SELECT answerable, clarity
+                FROM decisions
+                WHERE slug = ?
+                  AND answerable IS NOT NULL
+                  AND clarity IS NOT NULL
+                ORDER BY ABS(ts - ?)
+                LIMIT 1
+                """,
+                (row["slug"], row["ts"]),
+            ).fetchone()
+            if decision is None:
+                continue
+            self.conn.execute(
+                """
+                UPDATE evaluation_samples
+                SET jev_answerable = ?, jev_clarity = ?
+                WHERE id = ?
+                """,
+                (decision["answerable"], decision["clarity"], row["id"]),
             )
 
     def close(self) -> None:
@@ -405,6 +452,8 @@ class Store:
         seconds_left: int,
         quant_p: float | None,
         jev_p: float | None,
+        jev_answerable: float | None,
+        jev_clarity: int | None,
         market_p: float | None,
         yes_ask: float | None,
         no_ask: float | None,
@@ -416,9 +465,9 @@ class Store:
             """
             INSERT OR IGNORE INTO evaluation_samples
             (slug, condition_id, timeframe, strategy_version, checkpoint_seconds,
-             ts, seconds_left, quant_p, jev_p, market_p, yes_ask, no_ask,
-             book_json, state_json)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             ts, seconds_left, quant_p, jev_p, jev_answerable, jev_clarity,
+             market_p, yes_ask, no_ask, book_json, state_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 slug,
@@ -430,6 +479,8 @@ class Store:
                 int(seconds_left),
                 quant_p,
                 jev_p,
+                jev_answerable,
+                jev_clarity,
                 market_p,
                 yes_ask,
                 no_ask,
@@ -483,6 +534,309 @@ class Store:
         return self.conn.execute(
             "SELECT * FROM decisions ORDER BY ts DESC LIMIT ?", (limit,)
         ).fetchall()
+
+    def experiment_stats(
+        self,
+        strategy_version: str,
+        *,
+        min_edge: float = 0.08,
+        min_answerable: float = 0.70,
+        min_clarity: int = 2,
+        min_trade_price: float = 0.10,
+        max_trade_price: float = 0.90,
+    ) -> dict[str, Any]:
+        """Stats for one strategy version using fixed checkpoint samples only."""
+        c = self.conn
+        version_params = (strategy_version,)
+
+        n_dec = c.execute(
+            "SELECT COUNT(*) FROM decisions WHERE strategy_version = ?",
+            version_params,
+        ).fetchone()[0]
+        n_trade = c.execute(
+            """
+            SELECT COUNT(*) FROM decisions
+            WHERE strategy_version = ? AND action LIKE 'trade%'
+            """,
+            version_params,
+        ).fetchone()[0]
+        n_eval = self.evaluation_sample_count(strategy_version)
+        n_results = c.execute(
+            """
+            SELECT COUNT(DISTINCT r.slug)
+            FROM market_results r
+            JOIN evaluation_samples e ON e.slug = r.slug
+            WHERE e.strategy_version = ?
+            """,
+            version_params,
+        ).fetchone()[0]
+        n_dry_orders = c.execute(
+            """
+            SELECT COUNT(DISTINCT o.slug)
+            FROM orders o
+            WHERE o.dry_run = 1 AND o.status = 'dry_run'
+              AND EXISTS (
+                  SELECT 1 FROM evaluation_samples e
+                  WHERE e.slug = o.slug AND e.strategy_version = ?
+              )
+            """,
+            version_params,
+        ).fetchone()[0]
+
+        buckets = c.execute(
+            """
+            SELECT
+                CASE WHEN quant_p >= 1.0 THEN 9 ELSE CAST(quant_p * 10 AS INT) END AS b,
+                COUNT(*) AS n,
+                AVG(quant_p) AS avg_p,
+                AVG(market_p) AS avg_mkt
+            FROM evaluation_samples
+            WHERE strategy_version = ?
+              AND quant_p IS NOT NULL
+              AND market_p IS NOT NULL
+            GROUP BY b
+            ORDER BY b
+            """,
+            version_params,
+        ).fetchall()
+
+        return {
+            "strategy_version": strategy_version,
+            "decisions": n_dec,
+            "trade_signals": n_trade,
+            "evaluation_samples": n_eval,
+            "resolved_markets": n_results,
+            "dry_orders": n_dry_orders,
+            "buckets": [dict(r) for r in buckets],
+            "model_comparison": self.experiment_model_comparison(strategy_version),
+            "strategy_comparison": self.experiment_strategy_comparison(
+                strategy_version,
+                min_edge=min_edge,
+                min_answerable=min_answerable,
+                min_clarity=min_clarity,
+                min_trade_price=min_trade_price,
+                max_trade_price=max_trade_price,
+            ),
+            "dry_run_performance": self.experiment_dry_run_performance(
+                strategy_version
+            ),
+        }
+
+    def experiment_model_comparison(
+        self,
+        strategy_version: str,
+    ) -> list[dict[str, Any]]:
+        rows = self.conn.execute(
+            """
+            SELECT e.timeframe, e.quant_p, e.jev_p, e.market_p, r.up_won
+            FROM evaluation_samples e
+            JOIN market_results r ON r.slug = e.slug
+            WHERE e.strategy_version = ?
+              AND e.quant_p IS NOT NULL
+              AND e.jev_p IS NOT NULL
+              AND e.market_p IS NOT NULL
+            ORDER BY e.ts
+            """,
+            (strategy_version,),
+        ).fetchall()
+
+        scopes = ("全部", "5m", "15m", "1h")
+        model_names = ("量化 Φ(Z)", "Jev", "Polymarket")
+        by_scope = {
+            scope: {name: [] for name in model_names}
+            for scope in scopes
+        }
+        for row in rows:
+            y = int(row["up_won"])
+            timeframe = str(row["timeframe"])
+            values = {
+                "量化 Φ(Z)": float(row["quant_p"]),
+                "Jev": float(row["jev_p"]),
+                "Polymarket": float(row["market_p"]),
+            }
+            target_scopes = ["全部"]
+            if timeframe in {"5m", "15m", "1h"}:
+                target_scopes.append(timeframe)
+            for scope in target_scopes:
+                for name, p in values.items():
+                    by_scope[scope][name].append((p, y))
+
+        out: list[dict[str, Any]] = []
+        for scope in scopes:
+            for name in model_names:
+                values = by_scope[scope][name]
+                out.append({
+                    "timeframe": scope,
+                    "model": name,
+                    "n": len(values),
+                    "brier": self._brier(values),
+                    "log_loss": self._log_loss(values),
+                    "accuracy": self._direction_accuracy(values),
+                })
+        return out
+
+    def experiment_strategy_comparison(
+        self,
+        strategy_version: str,
+        *,
+        min_edge: float,
+        min_answerable: float,
+        min_clarity: int,
+        min_trade_price: float,
+        max_trade_price: float,
+    ) -> list[dict[str, Any]]:
+        rows = self.conn.execute(
+            """
+            SELECT e.slug, e.ts, e.timeframe, e.quant_p, e.jev_p,
+                   e.jev_answerable, e.jev_clarity, e.yes_ask, e.no_ask,
+                   r.up_won
+            FROM evaluation_samples e
+            JOIN market_results r ON r.slug = e.slug
+            WHERE e.strategy_version = ?
+            ORDER BY e.ts
+            """,
+            (strategy_version,),
+        ).fetchall()
+
+        configs = (
+            ("A 纯Φ(Z)", "quant", False),
+            ("B Φ(Z)+Jev门控", "quant", True),
+            ("C Jev概率", "jev", True),
+        )
+        scopes = ("全部", "5m", "15m", "1h")
+        state = {
+            (scope, name): {"seen": set(), "trades": 0, "wins": 0, "pnl": 0.0}
+            for scope in scopes
+            for name, _, _ in configs
+        }
+
+        def choose_trade(
+            p_up: float,
+            yes_ask: float | None,
+            no_ask: float | None,
+        ) -> tuple[str, float] | None:
+            choices: list[tuple[str, float, float]] = []
+            if yes_ask is not None and min_trade_price <= yes_ask <= max_trade_price:
+                choices.append(("UP", yes_ask, p_up - yes_ask))
+            if no_ask is not None and min_trade_price <= no_ask <= max_trade_price:
+                choices.append(("DOWN", no_ask, (1.0 - p_up) - no_ask))
+            if not choices:
+                return None
+            side, ask, edge = max(choices, key=lambda item: item[2])
+            return (side, ask) if edge >= min_edge else None
+
+        for row in rows:
+            timeframe = str(row["timeframe"] or "")
+            target_scopes = ["全部"]
+            if timeframe in {"5m", "15m", "1h"}:
+                target_scopes.append(timeframe)
+
+            yes_ask = (
+                float(row["yes_ask"]) if row["yes_ask"] is not None else None
+            )
+            no_ask = (
+                float(row["no_ask"]) if row["no_ask"] is not None else None
+            )
+            up_won = bool(row["up_won"])
+
+            for scope in target_scopes:
+                for name, probability_kind, use_gate in configs:
+                    bucket = state[(scope, name)]
+                    if row["slug"] in bucket["seen"]:
+                        continue
+
+                    if use_gate and (
+                        row["jev_answerable"] is None
+                        or float(row["jev_answerable"]) < min_answerable
+                        or row["jev_clarity"] is None
+                        or int(row["jev_clarity"]) < min_clarity
+                    ):
+                        continue
+
+                    p = row["quant_p"] if probability_kind == "quant" else row["jev_p"]
+                    if not isinstance(p, (int, float)):
+                        continue
+                    trade = choose_trade(float(p), yes_ask, no_ask)
+                    if trade is None:
+                        continue
+
+                    side, ask = trade
+                    bucket["seen"].add(row["slug"])
+                    bucket["trades"] += 1
+                    won = up_won if side == "UP" else not up_won
+                    if won:
+                        bucket["wins"] += 1
+                        bucket["pnl"] += (1.0 / ask) - 1.0
+                    else:
+                        bucket["pnl"] -= 1.0
+
+        out: list[dict[str, Any]] = []
+        for scope in scopes:
+            for name, _, _ in configs:
+                bucket = state[(scope, name)]
+                trades = int(bucket["trades"])
+                wins = int(bucket["wins"])
+                pnl = float(bucket["pnl"])
+                out.append({
+                    "timeframe": scope,
+                    "strategy": name,
+                    "trades": trades,
+                    "wins": wins,
+                    "hit_rate": wins / trades if trades else None,
+                    "pnl_usd": pnl,
+                    "roi": pnl / trades if trades else None,
+                })
+        return out
+
+    def experiment_dry_run_performance(
+        self,
+        strategy_version: str,
+    ) -> dict[str, Any]:
+        rows = self.conn.execute(
+            """
+            SELECT o.slug, o.outcome, o.price, o.size, o.usd, r.winner
+            FROM orders o
+            JOIN market_results r ON r.slug = o.slug
+            WHERE o.dry_run = 1
+              AND o.status = 'dry_run'
+              AND EXISTS (
+                  SELECT 1 FROM evaluation_samples e
+                  WHERE e.slug = o.slug AND e.strategy_version = ?
+              )
+            ORDER BY o.ts
+            """,
+            (strategy_version,),
+        ).fetchall()
+
+        pnl = 0.0
+        wins = 0
+        stake = 0.0
+        seen_slugs: set[str] = set()
+        counted = 0
+        for row in rows:
+            slug = str(row["slug"])
+            if slug in seen_slugs:
+                continue
+            seen_slugs.add(slug)
+            counted += 1
+            won = str(row["outcome"]).upper() == str(row["winner"]).upper()
+            usd = float(row["usd"] or 0)
+            size = float(row["size"] or 0)
+            stake += usd
+            if won:
+                wins += 1
+                pnl += size - usd
+            else:
+                pnl -= usd
+
+        return {
+            "trades": counted,
+            "wins": wins,
+            "hit_rate": wins / counted if counted else None,
+            "stake_usd": stake,
+            "pnl_usd": pnl,
+            "roi": pnl / stake if stake > 0 else None,
+        }
 
     def stats(
         self,
