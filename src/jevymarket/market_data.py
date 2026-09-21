@@ -230,13 +230,23 @@ async def fetch_binance_recent_history(
     out: list[dict[str, float]] = []
     if not isinstance(data, list):
         return out
+    now_ms = datetime.now(UTC).timestamp() * 1000.0
     for row in data:
         if not isinstance(row, list) or len(row) < 5:
             continue
         price = _float_or_none(row[4])
         if price is None:
             continue
-        out.append({"ts": float(row[0]) / 1000.0, "price": price})
+        # Real Binance rows include close time at index 6. Skip the unfinished
+        # current candle because we append the direct ticker price separately.
+        if len(row) > 6:
+            close_ms = float(row[6])
+            if close_ms > now_ms:
+                continue
+            ts = close_ms / 1000.0
+        else:
+            ts = float(row[0]) / 1000.0
+        out.append({"ts": ts, "price": price})
     return out
 
 
@@ -464,8 +474,19 @@ def compute_path_features(
     rv300 = _realized_vol_pct(w300)
     cadence = _median_interval(points)
     if cadence is not None and cadence <= 5:
+        recent_span = int(w60[-1][0] - w60[0][0]) if len(w60) >= 2 else 0
+        recent_gaps = [
+            w60[i][0] - w60[i - 1][0]
+            for i in range(1, len(w60))
+        ]
+        max_recent_gap = max(recent_gaps, default=999.0)
+        coverage_ready = (
+            recent_span >= min(55, min_history_seconds)
+            and max_recent_gap <= 5.0
+        )
         volatility_ready = rv60 is not None
     else:
+        coverage_ready = history_span >= max(180, min_history_seconds)
         volatility_ready = rv300 is not None or rv180 is not None
 
     feature_ready = (
@@ -473,6 +494,7 @@ def compute_path_features(
         and history_span >= min_history_seconds
         and latest_age is not None
         and latest_age <= max_sample_age_seconds
+        and coverage_ready
         and volatility_ready
     )
 
