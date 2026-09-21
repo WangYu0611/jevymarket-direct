@@ -335,6 +335,54 @@ def _normalize_event_time(value: datetime | None) -> datetime:
     return observed.astimezone(UTC)
 
 
+def record_chainlink_anchor_event(
+    settings: Settings,
+    store: Store,
+    *,
+    observed: datetime,
+    price: float,
+    twap_window: int,
+) -> list[str]:
+    """Record boundary events only; returns the newly inserted market slugs."""
+    allowed = {
+        value.strip().lower()
+        for value in settings.allowed_timeframes.split(",")
+        if value.strip().lower() in {"5m", "15m"}
+    }
+    grace = float(settings.anchor_capture_grace_seconds)
+    observed = _normalize_event_time(observed)
+    observed_ts = observed.timestamp()
+    inserted_slugs: list[str] = []
+
+    for timeframe in sorted(allowed):
+        duration = _WINDOW_SECONDS[timeframe]
+        start_epoch = int(observed_ts) // duration * duration
+        elapsed = observed_ts - start_epoch
+        if elapsed < 0 or elapsed > grace:
+            continue
+
+        slug = f"btc-updown-{timeframe}-{start_epoch}"
+        inserted = store.put_price_anchor(
+            slug=slug,
+            timeframe=timeframe,
+            window_start=float(start_epoch),
+            twap_window=twap_window,
+            price=price,
+            observed_ts=observed_ts,
+            source=f"Chainlink BTC/USD TWAP {twap_window}s 起始捕获",
+        )
+        if inserted:
+            inserted_slugs.append(slug)
+            log.info(
+                "已捕获 %s 起始价：$%.2f（Chainlink TWAP %ss，延迟 %.2fs）",
+                slug,
+                price,
+                twap_window,
+                elapsed,
+            )
+    return inserted_slugs
+
+
 async def watch_chainlink_anchors(
     settings: Settings,
     store: Store,
@@ -342,15 +390,12 @@ async def watch_chainlink_anchors(
     on_capture: Callable[[str, int, float], None] | None = None,
 ) -> None:
     """Continuously capture trusted 5m/15m Chainlink anchors at window boundaries."""
-    allowed = {
-        value.strip().lower()
+    if not any(
+        value.strip().lower() in {"5m", "15m"}
         for value in settings.allowed_timeframes.split(",")
-        if value.strip().lower() in {"5m", "15m"}
-    }
-    if not allowed:
+    ):
         return
 
-    grace = float(getattr(settings, "anchor_capture_grace_seconds", 12.0))
     specs = [
         CryptoPricesChainlinkTwapSpec(window_seconds=30, symbols=["btc/usd"]),
         CryptoPricesChainlinkTwapSpec(window_seconds=60, symbols=["btc/usd"]),
@@ -366,35 +411,16 @@ async def watch_chainlink_anchors(
                     if price is None:
                         continue
                     twap_window = int(event.payload.window_seconds)
-                    observed_ts = observed.timestamp()
-
-                    for timeframe in sorted(allowed):
-                        duration = _WINDOW_SECONDS[timeframe]
-                        start_epoch = int(observed_ts) // duration * duration
-                        elapsed = observed_ts - start_epoch
-                        if elapsed < 0 or elapsed > grace:
-                            continue
-
-                        slug = f"btc-updown-{timeframe}-{start_epoch}"
-                        inserted = store.put_price_anchor(
-                            slug=slug,
-                            timeframe=timeframe,
-                            window_start=float(start_epoch),
-                            twap_window=twap_window,
-                            price=price,
-                            observed_ts=observed_ts,
-                            source=f"Chainlink BTC/USD TWAP {twap_window}s 起始捕获",
-                        )
-                        if inserted:
-                            log.info(
-                                "已捕获 %s 起始价：$%.2f（Chainlink TWAP %ss，延迟 %.2fs）",
-                                slug,
-                                price,
-                                twap_window,
-                                elapsed,
-                            )
-                            if on_capture is not None:
-                                on_capture(slug, twap_window, price)
+                    inserted_slugs = record_chainlink_anchor_event(
+                        settings,
+                        store,
+                        observed=observed,
+                        price=price,
+                        twap_window=twap_window,
+                    )
+                    if on_capture is not None:
+                        for slug in inserted_slugs:
+                            on_capture(slug, twap_window, price)
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001
