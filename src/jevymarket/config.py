@@ -40,6 +40,8 @@ class Settings(BaseSettings):
     max_trade_price: float = 0.90
 
     # --- market filter -----------------------------------------------------
+    # Comma-separated crypto asset whitelist. Empty string disables the asset filter.
+    allowed_assets: str = "BTC,ETH,SOL"
     min_liquidity_usd: float = 5_000
     min_volume_usd: float = 10_000
     max_days_to_resolution: int = 60
