@@ -1,5 +1,17 @@
 from jevymarket.config import Settings
-from jevymarket.signal import Book, JevView, Skip, Trade, evaluate, kelly_fraction, round_to_tick
+from types import SimpleNamespace
+
+from jevymarket.signal import (
+    Book,
+    JevView,
+    Skip,
+    Trade,
+    evaluate,
+    kelly_fraction,
+    normal_cdf,
+    quantitative_up_probability,
+    round_to_tick,
+)
 
 
 def _settings(**kw) -> Settings:
@@ -104,3 +116,54 @@ def test_up_down_labels_are_preserved():
     t = evaluate(_view(p_yes=0.60), book, _settings())
     assert isinstance(t, Trade)
     assert t.outcome == "UP"
+
+
+def test_normal_cdf_basics():
+    assert abs(normal_cdf(0.0) - 0.5) < 1e-9
+    assert 0.90 < normal_cdf(1.30) < 0.91
+    assert 0.09 < normal_cdf(-1.30) < 0.10
+
+
+def test_quantitative_probability_uses_distance_z():
+    snapshot = SimpleNamespace(
+        path_features=SimpleNamespace(feature_ready=True, distance_z=1.30)
+    )
+    p = quantitative_up_probability(snapshot)
+    assert p is not None and 0.90 < p < 0.91
+
+
+def test_quantitative_probability_requires_ready_path():
+    snapshot = SimpleNamespace(
+        path_features=SimpleNamespace(feature_ready=False, distance_z=1.30)
+    )
+    assert quantitative_up_probability(snapshot) is None
+
+
+def test_probability_override_drives_trade_not_jev():
+    # Regression from dry-run logs: Jev said 32% Up while Z implied ~9.7%.
+    # At an 18-cent Up ask, the quantitative model must not buy Up.
+    view = _view(p_yes=0.32, answerable=0.91)
+    book = _book(yes_ask=0.18, yes_bid=0.17, min_size=1)
+    r = evaluate(
+        view,
+        book,
+        _settings(min_edge=0.08),
+        probability_yes=normal_cdf(-1.30),
+        probability_source="量化Φ(Z)",
+    )
+    assert isinstance(r, Skip)
+
+
+def test_quantitative_signal_avoids_false_down_edge():
+    # Regression from 1h logs: Z=+1.30 implies ~90% Up, while Jev said 67%.
+    # A 13-cent Down ask is not an edge under the quantitative baseline.
+    view = _view(p_yes=0.67, answerable=0.90)
+    book = _book(yes_ask=0.88, yes_bid=0.87, min_size=1)
+    r = evaluate(
+        view,
+        book,
+        _settings(min_edge=0.08),
+        probability_yes=normal_cdf(1.30),
+        probability_source="量化Φ(Z)",
+    )
+    assert isinstance(r, Skip)
