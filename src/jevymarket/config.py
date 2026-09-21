@@ -25,6 +25,7 @@ class Settings(BaseSettings):
     research_enabled: bool = True
     research_model: str = "deepseek-v4-pro"
     deepseek_base_url: str = "https://api.deepseek.com/anthropic/v1"
+    deepseek_json_base_url: str = "https://api.deepseek.com"
     research_ttl_hours: float = 6.0
     max_research_per_run: int = 20
     research_max_searches: int = 5
