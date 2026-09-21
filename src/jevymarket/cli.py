@@ -17,7 +17,7 @@ from .jev import JevClient, JevError, choice, noul, score
 from .market_data import ShortTermSnapshot, fetch_short_term_snapshots, watch_chainlink_anchors
 from .markets import TIMEFRAME_LABELS, Candidate, load_candidate, market_timeframe, scan
 from .research import Brief, Researcher, ResearchError
-from .signal import Trade, evaluate, get_brief, market_data_and_ask
+from .signal import Trade, evaluate, get_brief, market_data_and_ask, quantitative_up_probability
 from .store import Store
 
 app = typer.Typer(help="Polymarket BTC 短周期交易机器人：Chainlink/Binance 实时数据 + TypeSafe Jev。", no_args_is_help=True)
@@ -211,10 +211,29 @@ def decide(ref: str = typer.Argument(..., help="市场 slug 或 polymarket.com U
                 state, view = await market_data_and_ask(cand, s, jev, snapshot)
                 if show_state:
                     console.print_json(json.dumps(state, ensure_ascii=False, default=str))
-                result = evaluate(view, cand.book, s)
-                _print_decision(cand, view, result, snapshot=snapshot)
+                quant_p = quantitative_up_probability(snapshot)
+                if quant_p is None:
+                    console.print("[yellow]跳过：无法从价格路径计算量化上涨概率。[/]")
+                    return
+                state["quantitative_signal"] = {
+                    "p_up": quant_p,
+                    "method": "normal_cdf(distance_z)",
+                }
+                result = evaluate(
+                    view,
+                    cand.book,
+                    s,
+                    probability_yes=quant_p,
+                    probability_source="量化Φ(Z)",
+                )
+                _print_decision(
+                    cand, view, result, snapshot=snapshot, quant_p_yes=quant_p
+                )
                 store.log_decision(
-                    **_decision_row(cand, state, view, result, brief=None, executed=False)
+                    **_decision_row(
+                        cand, state, view, result, brief=None, executed=False,
+                        signal_p_yes=quant_p,
+                    )
                 )
         finally:
             store.close()
@@ -274,8 +293,25 @@ def run(
                     raise
                 continue
 
-            result = evaluate(view, cand.book, s)
-            _print_decision(cand, view, result, snapshot=snapshot)
+            quant_p = quantitative_up_probability(snapshot)
+            if quant_p is None:
+                console.print("  [yellow]跳过：无法从价格路径计算量化上涨概率。[/]")
+                continue
+
+            state["quantitative_signal"] = {
+                "p_up": quant_p,
+                "method": "normal_cdf(distance_z)",
+            }
+            result = evaluate(
+                view,
+                cand.book,
+                s,
+                probability_yes=quant_p,
+                probability_source="量化Φ(Z)",
+            )
+            _print_decision(
+                cand, view, result, snapshot=snapshot, quant_p_yes=quant_p
+            )
             executed = False
             if isinstance(result, Trade):
                 placed = await ex.place(cand, result)
@@ -289,7 +325,10 @@ def run(
                     )
 
             store.log_decision(
-                **_decision_row(cand, state, view, result, brief=None, executed=executed)
+                **_decision_row(
+                    cand, state, view, result, brief=None, executed=executed,
+                    signal_p_yes=quant_p,
+                )
             )
             if ex.trades_this_run >= s.max_trades_per_run:
                 console.print("[bold]本轮交易数量已达到上限[/]")
@@ -401,7 +440,7 @@ def stats():
     st = Store(s.db_path).stats()
     console.print(f"决策数={st['decisions']} 交易信号={st['trade_signals']} 研究摘要={st['briefs']} "
                   f"真实订单={st['live_orders']} 真实金额=${st['live_usd']:.2f}")
-    t = Table(title="Jev 主方向概率分桶 vs 市场中间价")
+    t = Table(title="交易概率分桶 vs 市场中间价")
     for col in ("概率区间", "样本数", "Jev均值", "市场均值"):
         t.add_column(col, justify="right")
     for b in st["buckets"]:
@@ -549,8 +588,15 @@ def _print_snapshot(snapshot: ShortTermSnapshot | None) -> None:
     )
 
 
-def _print_decision(c: Candidate, v, result, brief: Brief | None = None, cached: bool = False,
-                    snapshot: ShortTermSnapshot | None = None) -> None:
+def _print_decision(
+    c: Candidate,
+    v,
+    result,
+    brief: Brief | None = None,
+    cached: bool = False,
+    snapshot: ShortTermSnapshot | None = None,
+    quant_p_yes: float | None = None,
+) -> None:
     tf = market_timeframe(c.market, _settings()) or "?"
     primary = _outcome_cn(c.book.yes_label)
     secondary = _outcome_cn(c.book.no_label)
@@ -560,7 +606,9 @@ def _print_decision(c: Candidate, v, result, brief: Brief | None = None, cached:
         f"  原始问题：{c.question}\n"
         f"  盘口：买入{primary} {_fmt_cents(c.book.yes_ask)}；卖出{primary} {_fmt_cents(c.book.yes_bid)}；"
         f"买入{secondary} {_fmt_cents(c.book.no_ask)}；卖出{secondary} {_fmt_cents(c.book.no_bid)}\n"
-        f"  Jev：P({primary})={v.p_yes:.2f}  信息充分度={v.answerable:.2f}  "
+        f"  量化：P({primary})={('—' if quant_p_yes is None else f'{quant_p_yes:.2f}')} "
+        f"（Φ(Z)）\n"
+        f"  Jev参考：P({primary})={v.p_yes:.2f}  信息充分度={v.answerable:.2f}  "
         f"规则清晰度={v.clarity_mean}（置信度 {v.clarity_confidence}）"
     )
     console.print(head)
@@ -577,11 +625,20 @@ def _print_decision(c: Candidate, v, result, brief: Brief | None = None, cached:
         console.print(f"  [dim]跳过：{result.reason}[/]")
 
 
-def _decision_row(c: Candidate, state: dict, v, result, brief: Brief | None, executed: bool) -> dict:
+def _decision_row(
+    c: Candidate,
+    state: dict,
+    v,
+    result,
+    brief: Brief | None,
+    executed: bool,
+    signal_p_yes: float | None = None,
+) -> dict:
     is_trade = isinstance(result, Trade)
     return dict(
         slug=c.slug, condition_id=c.condition_id, question=c.question, state_json=state,
-        p_yes=v.p_yes, answerable=v.answerable, clarity=v.clarity,
+        p_yes=(v.p_yes if signal_p_yes is None else signal_p_yes),
+        answerable=v.answerable, clarity=v.clarity,
         yes_ask=c.book.yes_ask, no_ask=c.book.no_ask, midpoint=c.book.midpoint,
         edge=result.edge if is_trade else None,
         action=("trade" if is_trade else "skip") + ("" if not is_trade or executed else "_unexecuted"),
