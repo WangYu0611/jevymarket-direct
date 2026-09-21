@@ -57,3 +57,39 @@ async def test_4xx_raises_with_message():
         with pytest.raises(JevError) as ei:
             await jev.decide({}, {"q": noul("?")})
     assert ei.value.status == 401 and "bad key" in str(ei.value)
+
+
+@respx.mock
+async def test_transport_timeout_retries_then_succeeds(monkeypatch):
+    calls = 0
+
+    async def no_sleep(_seconds):
+        return None
+
+    async def handler(_request):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise httpx.ReadTimeout("temporary timeout")
+        return httpx.Response(200, json=SAMPLE)
+
+    monkeypatch.setattr("jevymarket.jev.asyncio.sleep", no_sleep)
+    respx.post(URL).mock(side_effect=handler)
+
+    async with JevClient(api_key="k", max_retries=2) as jev:
+        d = await jev.decide({}, {"urgent": noul("?")})
+
+    assert calls == 2
+    assert d.answers["urgent"].noul == 0.83
+
+
+@respx.mock
+async def test_transport_timeout_exhaustion_becomes_jev_error():
+    respx.post(URL).mock(side_effect=httpx.ReadTimeout("temporary timeout"))
+
+    async with JevClient(api_key="k", max_retries=1) as jev:
+        with pytest.raises(JevError) as ei:
+            await jev.decide({}, {"q": noul("?")})
+
+    assert ei.value.status == 0
+    assert "ReadTimeout" in str(ei.value)
