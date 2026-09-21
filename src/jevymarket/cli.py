@@ -47,8 +47,8 @@ def _researcher(s: Settings, enabled: bool) -> Researcher | None:
     if not (enabled and s.research_enabled):
         return None
     return Researcher(s.deepseek_api_key, model=s.research_model, base_url=s.deepseek_base_url,
-                      max_searches=s.research_max_searches, max_calls=s.max_research_per_run,
-                      exclude_domains=s.research_exclude_domains)
+                      json_base_url=s.deepseek_json_base_url, max_searches=s.research_max_searches,
+                      max_calls=s.max_research_per_run, exclude_domains=s.research_exclude_domains)
 
 
 def _jev(s: Settings) -> JevClient:
@@ -135,7 +135,8 @@ def research(ref: str = typer.Argument(..., help="Market slug or polymarket.com 
     async def go():
         store = Store(s.db_path)
         r = Researcher(s.deepseek_api_key, model=s.research_model, base_url=s.deepseek_base_url,
-                       max_searches=s.research_max_searches, exclude_domains=s.research_exclude_domains)
+                       json_base_url=s.deepseek_json_base_url, max_searches=s.research_max_searches,
+                       exclude_domains=s.research_exclude_domains)
         async with AsyncPublicClient() as c, r:
             cand = await load_candidate(c, s, ref)
             brief, cached = await get_brief(cand, s, store, r, fresh=fresh)
