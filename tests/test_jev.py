@@ -1,3 +1,5 @@
+import ssl
+
 import httpx
 import pytest
 import respx
@@ -93,3 +95,26 @@ async def test_transport_timeout_exhaustion_becomes_jev_error():
 
     assert ei.value.status == 0
     assert "ReadTimeout" in str(ei.value)
+
+@respx.mock
+async def test_ssl_error_retries_then_succeeds(monkeypatch):
+    calls = 0
+
+    async def no_sleep(_seconds):
+        return None
+
+    async def handler(_request):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise ssl.SSLError("record layer failure")
+        return httpx.Response(200, json=SAMPLE)
+
+    monkeypatch.setattr("jevymarket.jev.asyncio.sleep", no_sleep)
+    respx.post(URL).mock(side_effect=handler)
+
+    async with JevClient(api_key="k", max_retries=2) as jev:
+        d = await jev.decide({}, {"urgent": noul("?")})
+
+    assert calls == 2
+    assert d.answers["urgent"].noul == 0.83

@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import random
+import ssl
 from typing import Any
 
 import httpx
@@ -162,7 +163,7 @@ class JevClient:
                     json=body,
                     headers=self._headers,
                 )
-            except httpx.TransportError as exc:
+            except (httpx.TransportError, ssl.SSLError) as exc:
                 msg = f"{type(exc).__name__}: {exc or 'network transport error'}"
                 if attempt < self.max_retries:
                     sleep = delay * (1 + random.random())
