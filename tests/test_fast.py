@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 from rich.console import Console
+from rich.text import Text
 from typer.testing import CliRunner
 
 from jevymarket import fast_cli, fast_runner
@@ -247,9 +248,14 @@ async def test_read_failure_records_missing_not_fake_data(tmp_path, monkeypatch)
         st.close()
 
 
-def test_cli_refuses_live_before_any_api_call():
+def test_cli_refuses_live_before_any_api_call(monkeypatch):
+    run = AsyncMock()
+    monkeypatch.setattr(fast_cli, "run_fast", run)
     result = CliRunner().invoke(fast_cli.app, ["run"])
-    assert result.exit_code != 0 and "--dry-run" in result.output
+    # Rich may insert styling between the hyphens and the option name.
+    plain = Text.from_ansi(result.output).plain
+    assert result.exit_code == 2 and "--dry-run" in plain
+    run.assert_not_awaited()
 
 
 def test_stats_empty_v3_preserves_v2(tmp_path, monkeypatch):
@@ -269,3 +275,39 @@ def test_single_instance_lock_is_released(tmp_path):
                 pass
     with fast_cli.single_instance(path):
         pass
+
+
+def test_stats_populated_experiment_without_network(tmp_path, monkeypatch):
+    s = config()
+    s.db_path = str(tmp_path / "data.db")
+    monkeypatch.setattr(fast_cli, "settings", lambda: s)
+    st = FastStore(s.db_path)
+    slug = "btc-updown-5m-1790010000"
+    try:
+        st.ensure_experiment(VERSION, experiment_parameters(s, 10, True))
+        observation_id, _ = record(st, slug)
+        st.complete_jev(observation_id, view(), received_ts=105)
+        trade = quantitative_trade(.8, book(), s)
+        assert isinstance(trade, Trade)
+        st.paper_order(VERSION, slug, observation_id, trade, max_exposure=50)
+        st.put_market_result(slug=slug, condition_id="c", timeframe="5m", winner="UP", up_won=True,
+                             up_final_price=1, down_final_price=0, source="test")
+    finally:
+        st.close()
+    result = CliRunner().invoke(fast_cli.app, ["stats", "--no-settle"])
+    assert result.exit_code == 0, result.exception
+    assert VERSION in result.output and "Kelly" in result.output
+
+
+def test_dry_run_cli_dispatches_ten_second_profile(tmp_path, monkeypatch):
+    s = config()
+    s.db_path = str(tmp_path / "data.db")
+    monkeypatch.setattr(fast_cli, "settings", lambda: s)
+    run = AsyncMock()
+    monkeypatch.setattr(fast_cli, "run_fast", run)
+    result = CliRunner().invoke(fast_cli.app, ["run", "--dry-run", "--loop", "10", "--once"])
+    assert result.exit_code == 0, result.exception
+    run.assert_awaited_once()
+    assert run.await_args.kwargs["interval"] == 10
+    assert run.await_args.kwargs["version"] == VERSION
+    assert run.await_args.kwargs["once"]
