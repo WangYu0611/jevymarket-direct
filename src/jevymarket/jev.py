@@ -1,16 +1,13 @@
-"""Client for Jev (TypeSafe AI System One model) through OpenRouter's Decisions API.
+"""Client for Jev (TypeSafe AI System One model) through TypeSafe's official API.
 
-Jev is not a chat model. You hand it a JSON `state` and a map of typed `questions`; it
-returns a typed decision per question with calibrated probabilities. On OpenRouter this
-lives on a separate beta endpoint:
+Jev is not a chat model. You hand it a JSON ``state`` and a map of typed
+``questions``; it returns a typed decision per question with calibrated
+probabilities.
 
-    POST https://openrouter.ai/api/alpha/decisions
-    { "model": "typesafe/jev-1.13", "state": {...}, "questions": { name: {...} } }
+Official endpoint::
 
-Three question primitives:
-  noul   -> yes/no, answered as P(yes) in [0, 1]
-  choice -> one key out of `criteria` {key: description}, plus per-key probabilities
-  score  -> position on an ordinal rubric `criteria` [level0, level1, ...], plus probabilities
+    POST https://api.typesafe.ai/v1/systemone
+    {"model": "jev-latest", "state": {...}, "questions": {...}}
 """
 
 from __future__ import annotations
@@ -26,9 +23,6 @@ from pydantic import BaseModel, ConfigDict
 log = logging.getLogger(__name__)
 
 Question = dict[str, Any]
-
-
-# --- question builders -----------------------------------------------------
 
 
 def noul(instructions: str) -> Question:
@@ -47,11 +41,8 @@ def score(instructions: str, levels: list[str]) -> Question:
     return {"type": "score", "instructions": instructions, "criteria": list(levels)}
 
 
-# --- response models --------------------------------------------------------
-
-
 class Answer(BaseModel):
-    """One typed answer. Permissive on purpose: the endpoint is in beta."""
+    """One typed answer. Permissive so minor API additions do not break the bot."""
 
     model_config = ConfigDict(extra="allow")
 
@@ -68,7 +59,6 @@ class Answer(BaseModel):
 
     @property
     def noul(self) -> float | None:
-        """P(yes) for a noul question."""
         v = self._get("noul", "probability", "p", "value")
         if isinstance(v, bool):
             return 1.0 if v else 0.0
@@ -83,13 +73,11 @@ class Answer(BaseModel):
 
     @property
     def score_mean(self) -> float | None:
-        """Raw score as returned. The endpoint returns the expected value (e.g. 2.92), not a level."""
         v = self._get("score", "value")
         return float(v) if isinstance(v, (int, float)) else None
 
     @property
     def score(self) -> int | None:
-        """Nearest rubric level."""
         v = self.score_mean
         return int(round(v)) if v is not None else None
 
@@ -107,6 +95,7 @@ class Usage(BaseModel):
     model_config = ConfigDict(extra="allow")
     input_tokens: int = 0
     output_tokens: int = 0
+    # TypeSafe's direct API currently reports tokens, not request cost.
     cost: float = 0.0
 
 
@@ -121,54 +110,49 @@ class Decision(BaseModel):
 
 class JevError(RuntimeError):
     def __init__(self, status: int, message: str, body: Any = None):
-        super().__init__(f"Jev/OpenRouter {status}: {message}")
+        super().__init__(f"Jev/TypeSafe {status}: {message}")
         self.status = status
         self.message = message
         self.body = body
-
-
-# --- client -------------------------------------------------------------------
 
 
 class JevClient:
     def __init__(
         self,
         api_key: str,
-        model: str = "typesafe/jev-1.13",
-        base_url: str = "https://openrouter.ai/api",
+        model: str = "jev-latest",
+        base_url: str = "https://api.typesafe.ai/v1",
         timeout: float = 30.0,
         max_retries: int = 4,
         client: httpx.AsyncClient | None = None,
     ):
         if not api_key:
-            raise ValueError("OPENROUTER_API_KEY is required to call Jev")
+            raise ValueError("TYPESAFE_API_KEY is required to call Jev")
         self.model = model
         self.max_retries = max_retries
-        self._url = base_url.rstrip("/") + "/alpha/decisions"
+        self._url = base_url.rstrip("/") + "/systemone"
         self._own_client = client is None
         self._client = client or httpx.AsyncClient(timeout=timeout)
         self._headers = {
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
-            "HTTP-Referer": "https://github.com/markusbug/jevymarket",
-            "X-Title": "jevymarket",
         }
         self.total_cost = 0.0
         self.total_input_tokens = 0
+        self.total_output_tokens = 0
         self.calls = 0
 
     async def aclose(self) -> None:
         if self._own_client:
             await self._client.aclose()
 
-    async def __aenter__(self) -> JevClient:
+    async def __aenter__(self) -> "JevClient":
         return self
 
     async def __aexit__(self, *exc) -> None:
         await self.aclose()
 
     async def decide_raw(self, state: Any, questions: dict[str, Question]) -> dict[str, Any]:
-        """POST and return the raw JSON body (for schema inspection)."""
         body = {"model": self.model, "state": state, "questions": questions}
         delay = 0.5
         for attempt in range(1, self.max_retries + 1):
@@ -192,6 +176,7 @@ class JevClient:
         self.calls += 1
         self.total_cost += d.usage.cost
         self.total_input_tokens += d.usage.input_tokens
+        self.total_output_tokens += d.usage.output_tokens
         return d
 
 
@@ -212,4 +197,6 @@ def _error_message(resp: httpx.Response) -> str:
             return str(err)
         if "detail" in body:
             return str(body["detail"])
+        if "message" in body:
+            return str(body["message"])
     return (resp.text or resp.reason_phrase or "")[:300]
