@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
@@ -15,6 +16,42 @@ from .research import Brief
 from .signal import Book
 
 log = logging.getLogger(__name__)
+
+ASSET_ALIASES: dict[str, set[str]] = {
+    "BTC": {"bitcoin", "btc"},
+    "ETH": {"ethereum", "ether", "eth"},
+    "SOL": {"solana", "sol"},
+}
+
+
+def _allowed_asset_symbols(s: Settings) -> tuple[str, ...]:
+    return tuple(
+        symbol
+        for raw in s.allowed_assets.split(",")
+        if (symbol := raw.strip().upper())
+    )
+
+
+def market_asset_symbol(m: Market, s: Settings) -> str | None:
+    """Return the allowed crypto asset referenced by a market, or None.
+
+    Matching is token-based so short tickers such as ETH and SOL cannot match
+    substrings inside unrelated words.
+    """
+    allowed = _allowed_asset_symbols(s)
+    if not allowed:
+        return None
+
+    parts = [m.question or "", m.slug or "", m.category or ""]
+    for tag in m.tags or ():
+        parts.extend([tag.slug or "", tag.label or ""])
+    tokens = set(re.findall(r"[a-z0-9]+", " ".join(parts).lower()))
+
+    for symbol in allowed:
+        aliases = ASSET_ALIASES.get(symbol, {symbol.lower()})
+        if tokens & aliases:
+            return symbol
+    return None
 
 
 @dataclass(frozen=True)
@@ -79,6 +116,8 @@ def book_from_orderbooks(market: Market, books: list[OrderBook] | tuple[OrderBoo
 def passes_static_filters(m: Market, s: Settings) -> str | None:
     """Return a skip reason, or None if the market is a candidate."""
     st = m.state
+    if s.allowed_assets and market_asset_symbol(m, s) is None:
+        return f"asset not in whitelist [{s.allowed_assets}]"
     if not (st.active and st.accepting_orders) or st.closed or st.archived:
         return "not tradable"
     if not st.enable_order_book:
@@ -157,6 +196,8 @@ async def load_candidate(client: AsyncPublicClient, s: Settings, ref: str) -> Ca
         m = await client.get_market(slug=ref)
     if not (m.outcomes and m.outcomes.yes and m.outcomes.no):
         raise ValueError(f"{m.slug} is not a binary market")
+    if s.allowed_assets and market_asset_symbol(m, s) is None:
+        raise ValueError(f"{m.slug} is not for an allowed asset [{s.allowed_assets}]")
     return Candidate(market=m, book=await fetch_book(client, m))
 
 
