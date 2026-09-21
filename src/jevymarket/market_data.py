@@ -1,14 +1,22 @@
-"""Realtime reference data for BTC short-term Polymarket markets."""
+"""Authoritative short-term BTC reference data.
+
+5m/15m:
+- Current price: Polymarket RTDS Chainlink BTC/USD TWAP stream.
+- Target price: first trusted Chainlink TWAP captured at the window boundary and
+  persisted locally. If that anchor is missing, the window is not trade-ready.
+
+1h:
+- Target: Binance BTC/USDT 1H open.
+- Current: Binance BTC/USDT realtime stream.
+"""
 
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
-import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Callable
 
 import httpx
 from polymarket import AsyncPublicClient
@@ -16,6 +24,7 @@ from polymarket.streams import CryptoPricesChainlinkTwapSpec, CryptoPricesSpec
 
 from .config import Settings
 from .markets import market_timeframe, market_window
+from .store import Store
 
 if TYPE_CHECKING:
     from .markets import Candidate
@@ -23,11 +32,12 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 GAMMA_EVENTS_URL = "https://gamma-api.polymarket.com/events"
-POLYMARKET_EVENT_URL = "https://polymarket.com/event/{slug}"
 BINANCE_KLINES_URLS = (
     "https://api.binance.com/api/v3/klines",
     "https://api.binance.us/api/v3/klines",
 )
+
+_WINDOW_SECONDS = {"5m": 300, "15m": 900}
 
 
 @dataclass(frozen=True)
@@ -38,12 +48,41 @@ class ShortTermSnapshot:
     target_source: str | None
     current_source: str | None
     captured_at: datetime
+    twap_window_seconds: int | None = None
 
     @property
     def delta_usd(self) -> float | None:
         if self.target_price is None or self.current_price is None:
             return None
         return self.current_price - self.target_price
+
+    @property
+    def delta_pct(self) -> float | None:
+        if self.target_price is None or self.current_price is None or self.target_price == 0:
+            return None
+        return (self.current_price / self.target_price - 1.0) * 100.0
+
+    @property
+    def trade_ready(self) -> bool:
+        return (
+            self.target_price is not None
+            and self.current_price is not None
+            and self.seconds_left is not None
+            and self.seconds_left > 0
+        )
+
+    def to_state(self) -> dict[str, Any]:
+        return {
+            "target_price": self.target_price,
+            "current_price": self.current_price,
+            "delta_usd": self.delta_usd,
+            "delta_pct": self.delta_pct,
+            "seconds_left": self.seconds_left,
+            "target_source": self.target_source,
+            "current_source": self.current_source,
+            "twap_window_seconds": self.twap_window_seconds,
+            "trade_ready": self.trade_ready,
+        }
 
 
 def _float_or_none(value: Any) -> float | None:
@@ -57,7 +96,7 @@ def _float_or_none(value: Any) -> float | None:
 
 
 def extract_price_to_beat(payload: Any) -> float | None:
-    """Extract Polymarket's canonical opening reference price from exact-event Gamma JSON."""
+    """Extract a canonical priceToBeat/openPrice value from Gamma JSON."""
     price_keys = ("priceToBeat", "price_to_beat", "openPrice", "open_price")
 
     def walk(value: Any) -> float | None:
@@ -70,113 +109,14 @@ def extract_price_to_beat(payload: Any) -> float | None:
                 found = walk(child)
                 if found is not None:
                     return found
-            return None
-
-        if isinstance(value, list):
+        elif isinstance(value, list):
             for child in value:
                 found = walk(child)
                 if found is not None:
                     return found
-            return None
-
-        if isinstance(value, str) and value.lstrip().startswith(("{", "[")):
-            try:
-                return walk(json.loads(value))
-            except json.JSONDecodeError:
-                return None
-
         return None
 
     return walk(payload)
-
-
-_NEXT_DATA_RE = re.compile(
-    r'<script[^>]*\bid=["\']__NEXT_DATA__["\'][^>]*>(.*?)</script>',
-    re.IGNORECASE | re.DOTALL,
-)
-
-
-def extract_live_open_price(next_data: Any, slug: str, window_start: datetime | None) -> float | None:
-    """Find the exact React Query crypto-prices openPrice for this active window."""
-    candidates: list[tuple[int, int, float]] = []
-    start_epoch = str(int(window_start.timestamp())) if window_start is not None else ""
-    start_iso = (
-        window_start.astimezone(UTC).isoformat().replace("+00:00", "Z")
-        if window_start else ""
-    )
-    slug_l = slug.lower()
-
-    def walk(value: Any) -> None:
-        if isinstance(value, dict):
-            query_key = value.get("queryKey")
-            if query_key is not None:
-                key_text = json.dumps(query_key, ensure_ascii=False).lower()
-                if "crypto-prices" in key_text:
-                    state = value.get("state")
-                    data = state.get("data") if isinstance(state, dict) else None
-                    open_price = extract_price_to_beat(data)
-                    if open_price is not None:
-                        score = 4
-                        context_text = json.dumps(value, ensure_ascii=False).lower()
-                        if slug_l and slug_l in context_text:
-                            score += 8
-                        if start_epoch and start_epoch in context_text:
-                            score += 6
-                        if start_iso and start_iso.lower() in context_text:
-                            score += 6
-                        # Prefer the smallest matching query object when scores tie,
-                        # avoiding a broad parent that contains neighboring windows.
-                        candidates.append((score, -len(context_text), open_price))
-
-            for child in value.values():
-                walk(child)
-        elif isinstance(value, list):
-            for child in value:
-                walk(child)
-
-    walk(next_data)
-    if not candidates:
-        return None
-    candidates.sort(reverse=True)
-    best_score, _, best_price = candidates[0]
-    return best_price if best_score >= 4 else None
-
-
-def extract_live_open_price_from_html(
-    html: str,
-    slug: str,
-    window_start: datetime | None,
-) -> float | None:
-    match = _NEXT_DATA_RE.search(html)
-    if match is None:
-        return None
-    try:
-        payload = json.loads(match.group(1))
-    except json.JSONDecodeError:
-        return None
-    return extract_live_open_price(payload, slug, window_start)
-
-
-async def fetch_polymarket_live_open_price(
-    http: httpx.AsyncClient,
-    slug: str,
-    window_start: datetime | None,
-) -> float | None:
-    try:
-        response = await http.get(
-            POLYMARKET_EVENT_URL.format(slug=slug),
-            headers={
-                "User-Agent": (
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 Chrome/140 Safari/537.36"
-                )
-            },
-        )
-        response.raise_for_status()
-        return extract_live_open_price_from_html(response.text, slug, window_start)
-    except Exception as exc:  # noqa: BLE001
-        log.debug("Polymarket live openPrice unavailable for %s: %s", slug, exc)
-        return None
 
 
 def chainlink_twap_window_seconds(candidate: Candidate) -> int:
@@ -191,44 +131,8 @@ def chainlink_twap_window_seconds(candidate: Candidate) -> int:
     return 60
 
 
-async def fetch_price_to_beat(
-    http: httpx.AsyncClient,
-    slug: str,
-    *,
-    timeframe: str,
-    window_start: datetime | None,
-) -> tuple[float | None, str | None]:
-    """Fetch the canonical opening anchor for the exact Polymarket window."""
-    # Active Chainlink markets expose the page's exact crypto-prices openPrice in
-    # __NEXT_DATA__. This is the same anchor rendered as "Price to Beat" on the UI.
-    if timeframe in {"5m", "15m"}:
-        live = await fetch_polymarket_live_open_price(http, slug, window_start)
-        if live is not None:
-            return live, "Polymarket 页面 openPrice"
-
-    # Gamma often gains priceToBeat metadata later (especially after resolution).
-    try:
-        response = await http.get(GAMMA_EVENTS_URL, params={"slug": slug})
-        response.raise_for_status()
-        raw = response.json()
-        event = raw[0] if isinstance(raw, list) and raw else raw
-        price = extract_price_to_beat(event)
-        if price is not None:
-            return price, "Polymarket priceToBeat"
-    except Exception as exc:  # noqa: BLE001
-        log.debug("Gamma priceToBeat unavailable for %s: %s", slug, exc)
-
-    if timeframe == "1h" and window_start is not None:
-        price = await fetch_binance_hour_open(http, window_start)
-        if price is not None:
-            return price, "Binance 1H open"
-
-    return None, None
-
-
 async def fetch_binance_hour_open(http: httpx.AsyncClient, start: datetime) -> float | None:
-    start_utc = start.astimezone(UTC)
-    start_ms = int(start_utc.timestamp() * 1000)
+    start_ms = int(start.astimezone(UTC).timestamp() * 1000)
     params = {
         "symbol": "BTCUSDT",
         "interval": "1h",
@@ -247,6 +151,29 @@ async def fetch_binance_hour_open(http: httpx.AsyncClient, start: datetime) -> f
         except Exception as exc:  # noqa: BLE001
             log.debug("Binance 1H open unavailable from %s: %s", url, exc)
     return None
+
+
+async def fetch_hour_target(
+    http: httpx.AsyncClient,
+    slug: str,
+    window_start: datetime,
+) -> tuple[float | None, str | None]:
+    """Prefer Gamma's canonical anchor, then fall back to the Binance 1H open."""
+    try:
+        response = await http.get(GAMMA_EVENTS_URL, params={"slug": slug})
+        response.raise_for_status()
+        raw = response.json()
+        event = raw[0] if isinstance(raw, list) and raw else raw
+        price = extract_price_to_beat(event)
+        if price is not None:
+            return price, "Polymarket priceToBeat"
+    except Exception as exc:  # noqa: BLE001
+        log.debug("Gamma priceToBeat unavailable for %s: %s", slug, exc)
+
+    price = await fetch_binance_hour_open(http, window_start)
+    if price is not None:
+        return price, "Binance 1H open"
+    return None, None
 
 
 async def _first_stream_price(
@@ -315,9 +242,11 @@ async def fetch_short_term_snapshots(
     candidates: list[Candidate],
     settings: Settings,
     *,
+    store: Store | None = None,
     now: datetime | None = None,
     timeout_seconds: float = 3.0,
 ) -> dict[str, ShortTermSnapshot]:
+    """Build authoritative snapshots. Missing Chainlink anchors stay missing."""
     requested_at = now
     timeframes = {market_timeframe(c.market, settings) for c in candidates}
     chainlink_windows = {
@@ -334,23 +263,19 @@ async def fetch_short_term_snapshots(
         timeout_seconds=timeout_seconds,
     )
 
-    snapshots: dict[str, ShortTermSnapshot] = {}
-    async with httpx.AsyncClient(timeout=4.0, follow_redirects=True) as http:
-        target_tasks = []
-        target_meta: list[tuple[Candidate, str | None, tuple[datetime, datetime] | None]] = []
-
-        for candidate in candidates:
-            timeframe = market_timeframe(candidate.market, settings)
-            window = market_window(candidate.market, settings)
-            target_meta.append((candidate, timeframe, window))
-            target_tasks.append(fetch_price_to_beat(
-                http,
-                candidate.slug,
-                timeframe=timeframe or "",
-                window_start=window[0] if window else None,
-            ))
-
-        targets = await asyncio.gather(*target_tasks) if target_tasks else []
+    hour_targets: dict[str, tuple[float | None, str | None]] = {}
+    hour_candidates = [
+        candidate for candidate in candidates
+        if market_timeframe(candidate.market, settings) == "1h"
+    ]
+    if hour_candidates:
+        async with httpx.AsyncClient(timeout=4.0, follow_redirects=True) as http:
+            for candidate in hour_candidates:
+                window = market_window(candidate.market, settings)
+                if window is not None:
+                    hour_targets[candidate.slug] = await fetch_hour_target(
+                        http, candidate.slug, window[0]
+                    )
 
     captured_at = requested_at or datetime.now(UTC)
     if captured_at.tzinfo is None:
@@ -358,17 +283,28 @@ async def fetch_short_term_snapshots(
     else:
         captured_at = captured_at.astimezone(UTC)
 
-    for (candidate, timeframe, window), (target, target_source) in zip(
-        target_meta, targets, strict=True
-    ):
+    snapshots: dict[str, ShortTermSnapshot] = {}
+    for candidate in candidates:
+        timeframe = market_timeframe(candidate.market, settings)
+        window = market_window(candidate.market, settings)
+
+        target: float | None = None
+        target_source: str | None = None
+        twap_window: int | None = None
+
         if timeframe in {"5m", "15m"}:
             twap_window = chainlink_twap_window_seconds(candidate)
+            anchor = store.get_price_anchor(candidate.slug, twap_window) if store else None
+            if anchor is not None:
+                target = float(anchor["price"])
+                target_source = str(anchor["source"])
             current = chainlink_prices.get(twap_window)
             current_source = (
                 f"Chainlink BTC/USD TWAP {twap_window}s"
                 if current is not None else None
             )
         elif timeframe == "1h":
+            target, target_source = hour_targets.get(candidate.slug, (None, None))
             current = binance_price
             current_source = "Binance BTC/USDT" if current is not None else None
         else:
@@ -386,6 +322,83 @@ async def fetch_short_term_snapshots(
             target_source=target_source,
             current_source=current_source,
             captured_at=captured_at,
+            twap_window_seconds=twap_window,
         )
 
     return snapshots
+
+
+def _normalize_event_time(value: datetime | None) -> datetime:
+    observed = value or datetime.now(UTC)
+    if observed.tzinfo is None:
+        return observed.replace(tzinfo=UTC)
+    return observed.astimezone(UTC)
+
+
+async def watch_chainlink_anchors(
+    settings: Settings,
+    store: Store,
+    *,
+    on_capture: Callable[[str, int, float], None] | None = None,
+) -> None:
+    """Continuously capture trusted 5m/15m Chainlink anchors at window boundaries."""
+    allowed = {
+        value.strip().lower()
+        for value in settings.allowed_timeframes.split(",")
+        if value.strip().lower() in {"5m", "15m"}
+    }
+    if not allowed:
+        return
+
+    grace = float(getattr(settings, "anchor_capture_grace_seconds", 12.0))
+    specs = [
+        CryptoPricesChainlinkTwapSpec(window_seconds=30, symbols=["btc/usd"]),
+        CryptoPricesChainlinkTwapSpec(window_seconds=60, symbols=["btc/usd"]),
+    ]
+
+    while True:
+        client = AsyncPublicClient()
+        try:
+            async with await client.subscribe(specs) as stream:
+                async for event in stream:
+                    observed = _normalize_event_time(event.timestamp)
+                    price = _float_or_none(event.payload.value)
+                    if price is None:
+                        continue
+                    twap_window = int(event.payload.window_seconds)
+                    observed_ts = observed.timestamp()
+
+                    for timeframe in sorted(allowed):
+                        duration = _WINDOW_SECONDS[timeframe]
+                        start_epoch = int(observed_ts) // duration * duration
+                        elapsed = observed_ts - start_epoch
+                        if elapsed < 0 or elapsed > grace:
+                            continue
+
+                        slug = f"btc-updown-{timeframe}-{start_epoch}"
+                        inserted = store.put_price_anchor(
+                            slug=slug,
+                            timeframe=timeframe,
+                            window_start=float(start_epoch),
+                            twap_window=twap_window,
+                            price=price,
+                            observed_ts=observed_ts,
+                            source=f"Chainlink BTC/USD TWAP {twap_window}s 起始捕获",
+                        )
+                        if inserted:
+                            log.info(
+                                "已捕获 %s 起始价：$%.2f（Chainlink TWAP %ss，延迟 %.2fs）",
+                                slug,
+                                price,
+                                twap_window,
+                                elapsed,
+                            )
+                            if on_capture is not None:
+                                on_capture(slug, twap_window, price)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Chainlink 起始价监听断开：%s；3 秒后重连", exc)
+            await asyncio.sleep(3)
+        finally:
+            await client.close()
