@@ -656,6 +656,20 @@ def _normalize_event_time(value: datetime | None) -> datetime:
     return observed.astimezone(UTC)
 
 
+def _source_event_time(event: Any) -> datetime:
+    """Prefer the price payload's source timestamp over WebSocket receive time."""
+    payload_ts = getattr(getattr(event, "payload", None), "timestamp", None)
+    if isinstance(payload_ts, (int, float)) and not isinstance(payload_ts, bool):
+        seconds = float(payload_ts)
+        if seconds > 10_000_000_000:
+            seconds /= 1000.0
+        try:
+            return datetime.fromtimestamp(seconds, tz=UTC)
+        except (OSError, OverflowError, ValueError):
+            pass
+    return _normalize_event_time(getattr(event, "timestamp", None))
+
+
 def record_chainlink_anchor_event(
     settings: Settings,
     store: Store,
@@ -729,7 +743,7 @@ async def watch_chainlink_anchors(
         try:
             async with await client.subscribe(specs) as stream:
                 async for event in stream:
-                    observed = _normalize_event_time(event.timestamp)
+                    observed = _source_event_time(event)
                     price = _float_or_none(event.payload.value)
                     if price is None:
                         continue
