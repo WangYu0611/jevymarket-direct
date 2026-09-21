@@ -177,6 +177,47 @@ def _best(levels, pick) -> float | None:
     return pick(prices) if prices else None
 
 
+def _depth_within(
+    levels,
+    *,
+    best_price: float | None,
+    cents: float,
+    side: str,
+) -> float | None:
+    if best_price is None:
+        return None
+    total = 0.0
+    found = False
+    for lvl in levels or []:
+        price = float(lvl.price)
+        size = float(lvl.size)
+        if side == "bid":
+            include = price >= best_price - cents
+        else:
+            include = price <= best_price + cents
+        if include:
+            total += price * size
+            found = True
+    return total if found else 0.0
+
+
+def _directional_imbalance(
+    yes_bid_depth: float | None,
+    yes_ask_depth: float | None,
+    no_bid_depth: float | None,
+    no_ask_depth: float | None,
+) -> float | None:
+    values = (yes_bid_depth, yes_ask_depth, no_bid_depth, no_ask_depth)
+    if any(value is None for value in values):
+        return None
+    bullish = float(yes_bid_depth) + float(no_ask_depth)
+    bearish = float(yes_ask_depth) + float(no_bid_depth)
+    denom = bullish + bearish
+    if denom <= 0:
+        return None
+    return (bullish - bearish) / denom
+
+
 def book_from_orderbooks(market: Market, books: list[OrderBook] | tuple[OrderBook, ...]) -> Book:
     """Match books to the market's YES/NO tokens by asset id (order is not guaranteed)."""
     yes_id = market.outcomes.yes.token_id
@@ -184,17 +225,58 @@ def book_from_orderbooks(market: Market, books: list[OrderBook] | tuple[OrderBoo
     by_id = {str(b.asset_id): b for b in books}
     yb, nb = by_id.get(str(yes_id)), by_id.get(str(no_id))
     ref = yb or nb
+
+    yes_bid = _best(yb.bids, max) if yb else None
+    yes_ask = _best(yb.asks, min) if yb else None
+    no_bid = _best(nb.bids, max) if nb else None
+    no_ask = _best(nb.asks, min) if nb else None
+
+    yes_bid_depth = _depth_within(
+        yb.bids if yb else (),
+        best_price=yes_bid,
+        cents=0.05,
+        side="bid",
+    )
+    yes_ask_depth = _depth_within(
+        yb.asks if yb else (),
+        best_price=yes_ask,
+        cents=0.05,
+        side="ask",
+    )
+    no_bid_depth = _depth_within(
+        nb.bids if nb else (),
+        best_price=no_bid,
+        cents=0.05,
+        side="bid",
+    )
+    no_ask_depth = _depth_within(
+        nb.asks if nb else (),
+        best_price=no_ask,
+        cents=0.05,
+        side="ask",
+    )
+
     return Book(
         yes_token_id=str(yes_id),
         no_token_id=str(no_id),
-        yes_bid=_best(yb.bids, max) if yb else None,
-        yes_ask=_best(yb.asks, min) if yb else None,
-        no_bid=_best(nb.bids, max) if nb else None,
-        no_ask=_best(nb.asks, min) if nb else None,
+        yes_bid=yes_bid,
+        yes_ask=yes_ask,
+        no_bid=no_bid,
+        no_ask=no_ask,
         tick_size=float(ref.tick_size) if ref and ref.tick_size else float(market.trading.minimum_tick_size or 0.01),
         min_order_size=float(ref.min_order_size) if ref and ref.min_order_size else float(market.trading.minimum_order_size or 5),
         yes_label=str(market.outcomes.yes.label or "UP"),
         no_label=str(market.outcomes.no.label or "DOWN"),
+        yes_bid_depth_5c_usd=yes_bid_depth,
+        yes_ask_depth_5c_usd=yes_ask_depth,
+        no_bid_depth_5c_usd=no_bid_depth,
+        no_ask_depth_5c_usd=no_ask_depth,
+        directional_imbalance_5c=_directional_imbalance(
+            yes_bid_depth,
+            yes_ask_depth,
+            no_bid_depth,
+            no_ask_depth,
+        ),
     )
 
 
