@@ -122,8 +122,8 @@ class Executor:
             return f"本轮最大交易数 {self.s.max_trades_per_run} 已达到"
         if t.usd > self.s.max_usd_per_trade * 1.5:
             return f"${t.usd:.2f} 超过单笔交易上限"
-        if self.store.has_order_for(c.condition_id):
-            return "数据库记录显示该市场已经下过单"
+        if self.store.has_order_for(c.condition_id, include_dry_run=self.dry_run):
+            return "数据库记录显示该市场已经下过单（模拟模式同一市场也只记第一笔）"
         ex = await self.exposure()
         if c.condition_id in ex.condition_ids:
             return "链上已有该市场敞口"
