@@ -33,8 +33,10 @@ CLARITY_LEVELS = [
 QUESTIONS = {
     "resolves_yes": noul(
         "Given the market question, its description and resolution rules, this market "
-        "will resolve YES. If an `evidence` brief is present, weigh its dated facts and "
-        "latest development against `days_until_resolution`."
+        "will resolve YES. If `market_start_date` is present, treat events before that date "
+        "as background unless the resolution rules explicitly require a lookback. If an "
+        "`evidence` brief is present, weigh its dated facts and latest development against "
+        "`days_until_resolution`."
     ),
     "answerable": noul(
         "The state (including the `evidence` brief, if present) contains enough current and "
@@ -220,6 +222,7 @@ async def get_brief(c: Candidate, s: Settings, store: Store, researcher: Researc
             question=m.question,
             description=(m.description or "")[: s.description_max_chars * 2],
             resolution_source=m.resolution.source if m.resolution else None,
+            start_date=m.state.start_date.date().isoformat() if m.state.start_date else None,
             end_date=m.state.end_date.date().isoformat() if m.state.end_date else None,
             today=datetime.now(UTC).date().isoformat(),
         )
