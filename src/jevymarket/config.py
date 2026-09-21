@@ -46,6 +46,8 @@ class Settings(BaseSettings):
     short_term_min_liquidity_usd: float = 0.0
     short_term_min_volume_usd: float = 0.0
     anchor_capture_grace_seconds: float = 3.0
+    short_term_min_history_seconds: int = 60
+    short_term_max_sample_age_seconds: float = 5.0
     min_liquidity_usd: float = 5_000
     min_volume_usd: float = 10_000
     max_days_to_resolution: int = 60
