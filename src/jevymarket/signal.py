@@ -49,7 +49,9 @@ QUESTIONS = {
         "well-informed probability estimate. Give high answerability only when target/open "
         "price, current reference price, seconds remaining, and `path_features.feature_ready` "
         "are present, with recent non-stale history and at least short-term volatility/momentum "
-        "coverage. Missing or stale path history should materially reduce answerability."
+        "coverage. The optional `microstructure` block contains spread, nearby depth and "
+        "directional order-book imbalance but intentionally omits absolute market odds. "
+        "Missing or stale path history should materially reduce answerability."
     ),
     "clarity": score(
         "How clear and objective are the resolution criteria for this market?",
@@ -84,6 +86,21 @@ class Book:
     min_order_size: float
     yes_label: str = "YES"
     no_label: str = "NO"
+    yes_bid_depth_5c_usd: float | None = None
+    yes_ask_depth_5c_usd: float | None = None
+    no_bid_depth_5c_usd: float | None = None
+    no_ask_depth_5c_usd: float | None = None
+    directional_imbalance_5c: float | None = None
+
+    def microstructure_state(self) -> dict[str, float | None]:
+        return {
+            "spread": self.spread,
+            "yes_bid_depth_5c_usd": self.yes_bid_depth_5c_usd,
+            "yes_ask_depth_5c_usd": self.yes_ask_depth_5c_usd,
+            "no_bid_depth_5c_usd": self.no_bid_depth_5c_usd,
+            "no_ask_depth_5c_usd": self.no_ask_depth_5c_usd,
+            "directional_imbalance_5c": self.directional_imbalance_5c,
+        }
 
     @property
     def midpoint(self) -> float | None:
@@ -249,6 +266,7 @@ async def market_data_and_ask(
     state = build_state(c, s, brief=None)
     state.pop("market_implied_probability_primary", None)
     state["short_term_market_data"] = snapshot.to_state()
+    state["microstructure"] = c.book.microstructure_state()
     view = await ask_jev(jev, state)
     return state, view
 
