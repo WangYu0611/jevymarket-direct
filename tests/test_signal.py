@@ -1,6 +1,6 @@
-from jevymarket.config import Settings
 from types import SimpleNamespace
 
+from jevymarket.config import Settings
 from jevymarket.signal import (
     Book,
     JevView,
