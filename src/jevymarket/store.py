@@ -401,7 +401,15 @@ class Store:
             "SELECT * FROM decisions ORDER BY ts DESC LIMIT ?", (limit,)
         ).fetchall()
 
-    def stats(self) -> dict[str, Any]:
+    def stats(
+        self,
+        *,
+        min_edge: float = 0.08,
+        min_answerable: float = 0.70,
+        min_clarity: int = 2,
+        min_trade_price: float = 0.10,
+        max_trade_price: float = 0.90,
+    ) -> dict[str, Any]:
         c = self.conn
         n_dec = c.execute("SELECT COUNT(*) FROM decisions").fetchone()[0]
         n_trade = c.execute(
@@ -442,6 +450,13 @@ class Store:
             "live_usd": usd,
             "buckets": [dict(r) for r in buckets],
             "model_comparison": self.model_comparison(),
+            "strategy_comparison": self.strategy_comparison(
+                min_edge=min_edge,
+                min_answerable=min_answerable,
+                min_clarity=min_clarity,
+                min_trade_price=min_trade_price,
+                max_trade_price=max_trade_price,
+            ),
             "dry_run_performance": self.dry_run_performance(),
         }
 
@@ -509,6 +524,116 @@ class Store:
                 "brier": self._brier(values),
                 "log_loss": self._log_loss(values),
                 "accuracy": self._direction_accuracy(values),
+            })
+        return out
+
+    def strategy_comparison(
+        self,
+        *,
+        min_edge: float,
+        min_answerable: float,
+        min_clarity: int,
+        min_trade_price: float,
+        max_trade_price: float,
+    ) -> list[dict[str, Any]]:
+        """One hypothetical $1 trade per market, using the first qualifying snapshot."""
+        rows = self.conn.execute(
+            """
+            SELECT d.slug, d.ts, d.state_json, d.jev_p_yes, d.answerable,
+                   d.clarity, d.yes_ask, d.no_ask, r.up_won
+            FROM decisions d
+            JOIN market_results r ON r.slug = d.slug
+            ORDER BY d.ts
+            """
+        ).fetchall()
+
+        configs = (
+            ("A 纯Φ(Z)", "quant", False),
+            ("B Φ(Z)+Jev门控", "quant", True),
+            ("C Jev概率", "jev", True),
+        )
+        state = {
+            name: {"seen": set(), "trades": 0, "wins": 0, "pnl": 0.0}
+            for name, _, _ in configs
+        }
+
+        def choose_trade(
+            p_up: float,
+            yes_ask: float | None,
+            no_ask: float | None,
+        ) -> tuple[str, float] | None:
+            choices: list[tuple[str, float, float]] = []
+            if (
+                yes_ask is not None
+                and min_trade_price <= yes_ask <= max_trade_price
+            ):
+                choices.append(("UP", yes_ask, p_up - yes_ask))
+            if (
+                no_ask is not None
+                and min_trade_price <= no_ask <= max_trade_price
+            ):
+                choices.append(("DOWN", no_ask, (1.0 - p_up) - no_ask))
+            if not choices:
+                return None
+            side, ask, edge = max(choices, key=lambda item: item[2])
+            return (side, ask) if edge >= min_edge else None
+
+        for row in rows:
+            try:
+                decision_state = json.loads(row["state_json"] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                decision_state = {}
+            quant = decision_state.get("quantitative_signal")
+            quant_p = quant.get("p_up") if isinstance(quant, dict) else None
+            jev_p = row["jev_p_yes"]
+            yes_ask = float(row["yes_ask"]) if row["yes_ask"] is not None else None
+            no_ask = float(row["no_ask"]) if row["no_ask"] is not None else None
+            up_won = bool(row["up_won"])
+
+            for name, probability_kind, use_gate in configs:
+                bucket = state[name]
+                if row["slug"] in bucket["seen"]:
+                    continue
+
+                if use_gate and (
+                    row["answerable"] is None
+                    or float(row["answerable"]) < min_answerable
+                    or row["clarity"] is None
+                    or int(row["clarity"]) < min_clarity
+                ):
+                    continue
+
+                p = quant_p if probability_kind == "quant" else jev_p
+                if not isinstance(p, (int, float)):
+                    continue
+
+                trade = choose_trade(float(p), yes_ask, no_ask)
+                if trade is None:
+                    continue
+
+                side, ask = trade
+                bucket["seen"].add(row["slug"])
+                bucket["trades"] += 1
+                won = up_won if side == "UP" else not up_won
+                if won:
+                    bucket["wins"] += 1
+                    bucket["pnl"] += (1.0 / ask) - 1.0
+                else:
+                    bucket["pnl"] -= 1.0
+
+        out: list[dict[str, Any]] = []
+        for name, _, _ in configs:
+            bucket = state[name]
+            trades = int(bucket["trades"])
+            wins = int(bucket["wins"])
+            pnl = float(bucket["pnl"])
+            out.append({
+                "strategy": name,
+                "trades": trades,
+                "wins": wins,
+                "hit_rate": wins / trades if trades else None,
+                "pnl_usd": pnl,
+                "roi": pnl / trades if trades else None,
             })
         return out
 
