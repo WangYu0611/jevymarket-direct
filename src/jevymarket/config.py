@@ -68,6 +68,8 @@ class Settings(BaseSettings):
     dry_run: bool = False
     db_path: str = "jevymarket.db"
     log_level: str = Field(default="INFO")
+    strategy_version: str = "v2-microstructure-checkpoints"
+    evaluation_checkpoint_tolerance_seconds: int = 20
 
 
 def load_settings(**overrides) -> Settings:
