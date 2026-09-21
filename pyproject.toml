@@ -28,9 +28,9 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/markusbug/jevymarket"
-Repository = "https://github.com/markusbug/jevymarket"
-Issues = "https://github.com/markusbug/jevymarket/issues"
+Homepage = "https://github.com/WangYu0611/jevymarket-direct"
+Repository = "https://github.com/WangYu0611/jevymarket-direct"
+Issues = "https://github.com/WangYu0611/jevymarket-direct/issues"
 
 [project.scripts]
 jevymarket = "jevymarket.cli:app"
