@@ -45,6 +45,7 @@ class Settings(BaseSettings):
     allowed_timeframes: str = "5m,15m,1h"
     short_term_min_liquidity_usd: float = 0.0
     short_term_min_volume_usd: float = 0.0
+    anchor_capture_grace_seconds: float = 12.0
     min_liquidity_usd: float = 5_000
     min_volume_usd: float = 10_000
     max_days_to_resolution: int = 60
