@@ -57,6 +57,7 @@ CREATE TABLE IF NOT EXISTS orders (
     order_id TEXT,
     status TEXT,
     dry_run INTEGER,
+    strategy_version TEXT,
     response_json TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_decisions_slug ON decisions(slug);
@@ -137,6 +138,12 @@ class Store:
             self.conn.execute("ALTER TABLE decisions ADD COLUMN timeframe TEXT")
         if "strategy_version" not in cols:
             self.conn.execute("ALTER TABLE decisions ADD COLUMN strategy_version TEXT")
+
+        order_cols = {
+            r["name"] for r in self.conn.execute("PRAGMA table_info(orders)")
+        }
+        if "strategy_version" not in order_cols:
+            self.conn.execute("ALTER TABLE orders ADD COLUMN strategy_version TEXT")
 
         eval_cols = {
             r["name"] for r in self.conn.execute("PRAGMA table_info(evaluation_samples)")
@@ -503,6 +510,29 @@ class Store:
             ).fetchone()[0]
         )
 
+    def clear_experiment_data(self) -> dict[str, int]:
+        """Clear research/decision simulation data while preserving authoritative/live data."""
+        counts = {
+            "decisions": int(
+                self.conn.execute("SELECT COUNT(*) FROM decisions").fetchone()[0]
+            ),
+            "evaluation_samples": int(
+                self.conn.execute(
+                    "SELECT COUNT(*) FROM evaluation_samples"
+                ).fetchone()[0]
+            ),
+            "dry_run_orders": int(
+                self.conn.execute(
+                    "SELECT COUNT(*) FROM orders WHERE dry_run = 1"
+                ).fetchone()[0]
+            ),
+        }
+        self.conn.execute("DELETE FROM evaluation_samples")
+        self.conn.execute("DELETE FROM decisions")
+        self.conn.execute("DELETE FROM orders WHERE dry_run = 1")
+        self.conn.commit()
+        return counts
+
     # --- research cache ------------------------------------------------------
 
     def get_brief(self, slug: str, max_age_s: float) -> dict | None:
@@ -574,11 +604,9 @@ class Store:
             """
             SELECT COUNT(DISTINCT o.slug)
             FROM orders o
-            WHERE o.dry_run = 1 AND o.status = 'dry_run'
-              AND EXISTS (
-                  SELECT 1 FROM evaluation_samples e
-                  WHERE e.slug = o.slug AND e.strategy_version = ?
-              )
+            WHERE o.dry_run = 1
+              AND o.status = 'dry_run'
+              AND o.strategy_version = ?
             """,
             version_params,
         ).fetchone()[0]
@@ -799,10 +827,7 @@ class Store:
             JOIN market_results r ON r.slug = o.slug
             WHERE o.dry_run = 1
               AND o.status = 'dry_run'
-              AND EXISTS (
-                  SELECT 1 FROM evaluation_samples e
-                  WHERE e.slug = o.slug AND e.strategy_version = ?
-              )
+              AND o.strategy_version = ?
             ORDER BY o.ts
             """,
             (strategy_version,),
