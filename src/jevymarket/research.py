@@ -1,10 +1,9 @@
-"""Researcher step: a generative model with web search writes a dated, sourced evidence brief.
+"""Research current facts with DeepSeek's official API and native web search.
 
-Jev has no browsing and a training cutoff, so on news-driven markets it (correctly) reports that
-the question is not answerable from what it was given. This module fills that gap: it asks a
-chat model through OpenRouter's web-search plugin to gather the *current* facts relevant to
-resolution, and returns them as a compact `Brief` that goes into the Jev state. The researcher
-never estimates a probability — that stays with Jev.
+The researcher uses DeepSeek's Anthropic-compatible Messages endpoint with the
+``web_search_20250305`` server tool. DeepSeek performs the search server-side;
+this module then parses the final JSON brief and passes only compact evidence to
+Jev. The researcher never estimates market probability.
 """
 
 from __future__ import annotations
@@ -16,14 +15,12 @@ import random
 import re
 from dataclasses import dataclass, field
 from typing import Any
+from urllib.parse import urlparse
 
 import httpx
 
 log = logging.getLogger(__name__)
 
-REPO_URL = "https://github.com/markusbug/jevymarket"
-
-# Odds sites and their mirrors: they only reflect market prices, which Jev must not see.
 DEFAULT_EXCLUDE_DOMAINS = [
     "polymarket.com", "kalshi.com", "polyspotter.com", "polyveritas.com", "hkimarket.com",
     "manifold.markets", "metaculus.com", "predictit.org", "polymarketanalytics.com",
@@ -32,36 +29,34 @@ DEFAULT_EXCLUDE_DOMAINS = [
 
 SYSTEM_PROMPT = """You are a neutral research analyst supporting a prediction-market pricing model.
 Your only job is to find and report the CURRENT facts that bear on how the given market question
-will resolve. Search the web. Prefer primary and reputable sources.
+will resolve. You MUST use the web_search tool. Prefer primary and reputable sources.
 
 Rules:
 - Source from news outlets, wire services, official government/organisation statements, regulators,
   league/federation sites, company filings, and reference data. Prediction-market sites and their
-  mirrors (polymarket, kalshi, polyspotter, polyveritas, hkimarket, manifold, metaculus, etc.) are
-  NOT sources: they only reflect odds, and this analysis must not see odds.
-- Every fact must carry a date (YYYY-MM-DD). If you cannot date it, say "undated".
-- Do not restate the market's resolution rules as facts; the reader already has them. Report what
-  has actually happened in the world.
-- Quote resolution-relevant numbers, names, deadlines and official statements exactly.
+  mirrors are NOT sources: they only reflect odds, and this analysis must not see odds.
+- Every fact must carry a date (YYYY-MM-DD). If you cannot date it, say \"undated\".
+- Do not restate the market's resolution rules as facts; the reader already has them.
+- Quote resolution-relevant numbers, names, deadlines and official statements exactly when available.
 - Report the most recent development you can find and its date.
-- Give considerations for and against a YES resolution as short factual bullets — not opinions.
+- Give considerations for and against a YES resolution as short factual bullets, not opinions.
 - Do NOT estimate a probability, do NOT say what you would bet, do NOT summarize market odds.
 - If you find nothing relevant, say so plainly in `summary`.
-- Output strictly one JSON object, no prose around it, with exactly these keys:
+- Your FINAL text block must be strictly one JSON object, no prose around it, with exactly these keys:
   {
-    "as_of": "YYYY-MM-DD (date of the newest fact you found)",
-    "summary": "2-4 sentences: current status relevant to resolution",
-    "key_facts": ["YYYY-MM-DD: fact", ...],           // 3-8 items
-    "latest_development": "YYYY-MM-DD: what happened most recently",
-    "for_yes": ["short factual point", ...],           // 0-5 items
-    "against_yes": ["short factual point", ...],       // 0-5 items
-    "sources": ["https://...", ...]
+    \"as_of\": \"YYYY-MM-DD (date of the newest fact you found)\",
+    \"summary\": \"2-4 sentences: current status relevant to resolution\",
+    \"key_facts\": [\"YYYY-MM-DD: fact\", ...],
+    \"latest_development\": \"YYYY-MM-DD: what happened most recently\",
+    \"for_yes\": [\"short factual point\", ...],
+    \"against_yes\": [\"short factual point\", ...],
+    \"sources\": [\"https://...\", ...]
   }"""
 
 
 class ResearchError(RuntimeError):
     def __init__(self, status: int, message: str, body: Any = None):
-        super().__init__(f"Researcher/OpenRouter {status}: {message}")
+        super().__init__(f"Researcher/DeepSeek {status}: {message}")
         self.status = status
         self.message = message
         self.body = body
@@ -81,7 +76,7 @@ class Brief:
     raw: dict = field(default_factory=dict)
 
     @classmethod
-    def from_json(cls, data: dict, model: str = "", cost: float = 0.0, raw: dict | None = None) -> Brief:
+    def from_json(cls, data: dict, model: str = "", cost: float = 0.0, raw: dict | None = None) -> "Brief":
         def _list(x) -> list[str]:
             if isinstance(x, list):
                 return [str(i).strip() for i in x if str(i).strip()]
@@ -116,7 +111,6 @@ class Brief:
         }
 
     def to_state(self, max_chars: int = 2500) -> dict:
-        """Compact evidence block for the Jev state. Sources/model/cost are noise to Jev."""
         ev: dict = {
             "as_of": self.as_of,
             "summary": self.summary,
@@ -125,7 +119,6 @@ class Brief:
             "considerations_for_yes": list(self.for_yes),
             "considerations_against_yes": list(self.against_yes),
         }
-        # Trim list fields from the tail until the block fits.
         while len(json.dumps(ev)) > max_chars:
             for key in ("considerations_against_yes", "considerations_for_yes", "key_facts"):
                 if ev[key]:
@@ -141,9 +134,10 @@ class Researcher:
     def __init__(
         self,
         api_key: str,
-        model: str = "deepseek/deepseek-v4-pro-0813",
-        base_url: str = "https://openrouter.ai/api",
-        max_results: int = 5,
+        model: str = "deepseek-v4-pro",
+        base_url: str = "https://api.deepseek.com/anthropic/v1",
+        max_searches: int = 5,
+        max_tokens: int = 4096,
         timeout: float = 120.0,
         max_retries: int = 3,
         max_calls: int | None = None,
@@ -151,29 +145,33 @@ class Researcher:
         client: httpx.AsyncClient | None = None,
     ):
         if not api_key:
-            raise ValueError("OPENROUTER_API_KEY is required for the researcher")
+            raise ValueError("DEEPSEEK_API_KEY is required for the researcher")
         self.model = model
-        self.max_results = max_results
+        self.max_searches = max_searches
+        self.max_tokens = max_tokens
         self.max_retries = max_retries
         self.max_calls = max_calls
         self.exclude_domains = DEFAULT_EXCLUDE_DOMAINS if exclude_domains is None else exclude_domains
-        self._url = base_url.rstrip("/") + "/v1/chat/completions"
+        self._url = base_url.rstrip("/") + "/messages"
         self._own_client = client is None
         self._client = client or httpx.AsyncClient(timeout=timeout)
         self._headers = {
+            "x-api-key": api_key,
             "Authorization": f"Bearer {api_key}",
+            "anthropic-version": "2023-06-01",
             "Content-Type": "application/json",
-            "HTTP-Referer": REPO_URL,
-            "X-Title": "jevymarket",
+            "Accept": "application/json",
         }
         self.calls = 0
         self.total_cost = 0.0
+        self.total_input_tokens = 0
+        self.total_output_tokens = 0
 
     async def aclose(self) -> None:
         if self._own_client:
             await self._client.aclose()
 
-    async def __aenter__(self) -> Researcher:
+    async def __aenter__(self) -> "Researcher":
         return self
 
     async def __aexit__(self, *exc) -> None:
@@ -186,7 +184,7 @@ class Researcher:
     def _user_prompt(self, question: str, description: str, resolution_source: str | None,
                      end_date: str | None, today: str) -> str:
         parts = [
-            f"Latest news and official statements relevant to: {question}",
+            f"Research the latest news and official statements relevant to: {question}",
             f"Today is {today}.",
             f"Resolution rules / description:\n{description or '(none given)'}",
         ]
@@ -194,50 +192,70 @@ class Researcher:
             parts.append(f"Stated resolution source: {resolution_source}")
         if end_date:
             parts.append(f"Market end date: {end_date}")
-        parts.append("Research the current status and return the JSON object.")
+        parts.append("Use web_search before answering, then return the required JSON object.")
         return "\n\n".join(parts)
 
     async def brief(self, question: str, description: str, resolution_source: str | None,
                     end_date: str | None, today: str) -> Brief:
         if not self.budget_left:
             raise ResearchError(0, f"research budget of {self.max_calls} calls for this run exhausted")
+
+        web_tool: dict[str, Any] = {
+            "type": "web_search_20250305",
+            "name": "web_search",
+            "max_uses": self.max_searches,
+        }
+        if self.exclude_domains:
+            web_tool["blocked_domains"] = self.exclude_domains
+
         body = {
             "model": self.model,
-            "messages": [
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": self._user_prompt(question, description, resolution_source, end_date, today)},
-            ],
-            "plugins": [{
-                "id": "web",
-                "engine": "exa",
-                "max_results": self.max_results,
-                **({"exclude_domains": self.exclude_domains} if self.exclude_domains else {}),
-                "search_prompt": (
-                    f"Web search results as of {today}. Use only news, official and reference "
-                    "sources to establish the current, dated facts relevant to the market question; "
-                    "ignore prediction-market pages and odds. Cite sources by URL."
-                ),
+            "max_tokens": self.max_tokens,
+            "system": SYSTEM_PROMPT,
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "text",
+                    "text": self._user_prompt(question, description, resolution_source, end_date, today),
+                }],
             }],
-            "response_format": {"type": "json_object"},
-            "temperature": 0.2,
-            "usage": {"include": True},
+            "tools": [web_tool],
         }
         data = await self._post(body)
         self.calls += 1
-        try:
-            msg = data["choices"][0]["message"]
-        except (KeyError, IndexError, TypeError) as e:
-            raise ResearchError(200, f"unexpected response shape: {e}", data) from e
-        parsed = parse_json_object(msg.get("content") or "")
+
+        blocks = data.get("content") or []
+        if not isinstance(blocks, list):
+            raise ResearchError(200, "unexpected response shape: content is not a list", data)
+        if not any(isinstance(b, dict) and b.get("type") == "web_search_tool_result" for b in blocks):
+            raise ResearchError(200, "DeepSeek did not return web_search_tool_result; current facts were not verified", data)
+
+        # Safety invariant from the original bot: Jev must not receive evidence derived
+        # from prediction-market / odds sites. DeepSeek is asked to block them server-side;
+        # if one still leaks through, reject the entire brief rather than silently use it.
+        leaked = excluded_urls(extract_search_urls(blocks), self.exclude_domains)
+        if leaked:
+            raise ResearchError(200, f"excluded-domain search results leaked into research: {leaked}", data)
+
+        text = "\n".join(
+            str(b.get("text") or "")
+            for b in blocks
+            if isinstance(b, dict) and b.get("type") == "text" and b.get("text")
+        )
+        parsed = parse_json_object(text)
         if parsed is None:
             raise ResearchError(200, "researcher did not return a JSON object", data)
-        cost = float((data.get("usage") or {}).get("cost") or 0.0)
-        self.total_cost += cost
-        b = Brief.from_json(parsed, model=str(data.get("model") or self.model), cost=cost, raw=data)
-        for ann in msg.get("annotations") or []:
-            cite = ann.get("url_citation") if isinstance(ann, dict) else None
-            url = (cite or {}).get("url")
-            if url and url not in b.sources:
+
+        usage = data.get("usage") or {}
+        self.total_input_tokens += int(usage.get("input_tokens") or 0)
+        self.total_output_tokens += int(usage.get("output_tokens") or 0)
+
+        b = Brief.from_json(parsed, model=str(data.get("model") or self.model), cost=0.0, raw=data)
+        leaked = excluded_urls(b.sources, self.exclude_domains)
+        if leaked:
+            raise ResearchError(200, f"excluded-domain URLs appeared in researcher JSON: {leaked}", data)
+        for url in extract_search_urls(blocks):
+            if url not in b.sources:
                 b.sources.append(url)
         return b
 
@@ -263,7 +281,6 @@ _FENCE = re.compile(r"```(?:json)?\s*(.*?)```", re.S)
 
 
 def parse_json_object(text: str) -> dict | None:
-    """Parse a JSON object from model output, tolerating code fences and surrounding prose."""
     text = text.strip()
     if not text:
         return None
@@ -282,6 +299,44 @@ def parse_json_object(text: str) -> dict | None:
     return None
 
 
+def extract_search_urls(blocks: list[Any]) -> list[str]:
+    """Collect unique URLs from native search results and citation metadata."""
+    out: list[str] = []
+    seen: set[str] = set()
+
+    def add(url: Any) -> None:
+        if isinstance(url, str) and url and url not in seen:
+            seen.add(url)
+            out.append(url)
+
+    for block in blocks:
+        if not isinstance(block, dict):
+            continue
+        if block.get("type") == "web_search_tool_result" and isinstance(block.get("content"), list):
+            for item in block["content"]:
+                if isinstance(item, dict) and item.get("type") == "web_search_result":
+                    add(item.get("url"))
+        if block.get("type") == "text":
+            for cite in block.get("citations") or []:
+                if isinstance(cite, dict):
+                    add(cite.get("url"))
+    return out
+
+
+def excluded_urls(urls: list[str], blocked_domains: list[str]) -> list[str]:
+    """Return URLs whose hostname is a blocked domain or one of its subdomains."""
+    blocked = {d.lower().strip(".") for d in blocked_domains if d}
+    out: list[str] = []
+    for url in urls:
+        try:
+            host = (urlparse(url).hostname or "").lower().strip(".")
+        except ValueError:
+            continue
+        if host and any(host == d or host.endswith("." + d) for d in blocked):
+            out.append(url)
+    return out
+
+
 def _safe_json(resp: httpx.Response) -> Any:
     try:
         return resp.json()
@@ -297,4 +352,6 @@ def _error_message(resp: httpx.Response) -> str:
             return str(err.get("message") or err)
         if err:
             return str(err)
+        if body.get("message"):
+            return str(body["message"])
     return (resp.text or resp.reason_phrase or "")[:300]
