@@ -215,7 +215,7 @@ class FastRunner:
             yes_ask=cand.book.yes_ask if cand else None, no_ask=cand.book.no_ask if cand else None,
             status=status, reason=reason, payload=payload,
         )
-        timestamp = datetime.now().astimezone().strftime("%H:%M:%S")
+        timestamp = datetime.now(UTC).astimezone().strftime("%H:%M:%S")
         gap_text = "首次" if gap is None else f"{gap:.1f}s"
         if quant_p is None:
             self.console.print(f"[{timestamp}] BTC 5m | 间隔 {gap_text} | 不完整：{reason}", markup=False)
@@ -231,8 +231,11 @@ class FastRunner:
             self.console.print(f"  checkpoint T-{cp}s 已记录，实际剩余 {snapshot.seconds_left}s", markup=False)
             self.shadow.offer(observation_id, cand, self.s, snapshot)
         if isinstance(result, Trade):
-            reason = self.store.paper_order(self.version, slug, observation_id, result,
-                                            max_exposure=self.s.max_open_exposure_usd)
+            if current_slug() != slug or time.time() - observed_ts > self.s.short_term_max_sample_age_seconds:
+                reason = "记录/输出期间报价已过期或窗口结束；不模拟下单"
+            else:
+                reason = self.store.paper_order(self.version, slug, observation_id, result,
+                                                max_exposure=self.s.max_open_exposure_usd)
         self.console.print(f"  {reason}", markup=False)
 
 
