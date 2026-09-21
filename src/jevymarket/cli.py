@@ -13,6 +13,7 @@ from rich.table import Table
 
 from . import __version__
 from .config import Settings, load_settings
+from .evaluation import checkpoint_for
 from .jev import JevClient, JevError, choice, noul, score
 from .market_data import ShortTermSnapshot, fetch_short_term_snapshots, watch_chainlink_anchors
 from .markets import TIMEFRAME_LABELS, Candidate, fetch_book, load_candidate, market_timeframe, scan
@@ -240,6 +241,9 @@ def decide(ref: str = typer.Argument(..., help="市场 slug 或 polymarket.com U
                     "method": "normal_cdf(distance_z)",
                     "execution_snapshot": fresh_snapshot.to_state(),
                 }
+                _record_checkpoint_sample(
+                    store, fresh_cand, s, fresh_snapshot, state, view, quant_p
+                )
                 result = evaluate(
                     view,
                     fresh_cand.book,
@@ -347,6 +351,9 @@ def run(
                 "method": "normal_cdf(distance_z)",
                 "execution_snapshot": fresh_snapshot.to_state(),
             }
+            _record_checkpoint_sample(
+                store, fresh_cand, s, fresh_snapshot, state, view, quant_p
+            )
             result = evaluate(
                 view,
                 fresh_cand.book,
@@ -696,6 +703,46 @@ def _status_cn(status: str) -> str:
     }.get(status, status)
 
 
+def _record_checkpoint_sample(
+    store: Store,
+    c: Candidate,
+    s: Settings,
+    snapshot: ShortTermSnapshot,
+    state: dict,
+    view,
+    quant_p: float,
+) -> None:
+    tf = market_timeframe(c.market, s)
+    if tf is None:
+        return
+    checkpoint = checkpoint_for(
+        tf,
+        snapshot.seconds_left,
+        tolerance_seconds=s.evaluation_checkpoint_tolerance_seconds,
+    )
+    if checkpoint is None or snapshot.seconds_left is None:
+        return
+    inserted = store.log_evaluation_sample(
+        slug=c.slug,
+        condition_id=c.condition_id,
+        timeframe=tf,
+        strategy_version=s.strategy_version,
+        checkpoint_seconds=checkpoint,
+        seconds_left=snapshot.seconds_left,
+        quant_p=quant_p,
+        jev_p=view.p_yes,
+        market_p=c.book.midpoint,
+        yes_ask=c.book.yes_ask,
+        no_ask=c.book.no_ask,
+        book_json=c.book.microstructure_state(),
+        state_json=state,
+    )
+    if inserted:
+        console.print(
+            f"  [dim]实验样本：{s.strategy_version} / {tf} / T-{checkpoint}s 已记录[/]"
+        )
+
+
 def _print_snapshot(snapshot: ShortTermSnapshot | None) -> None:
     if snapshot is None:
         console.print("  [yellow]参考数据：未获取[/]")
@@ -787,6 +834,7 @@ def _decision_row(
         p_yes=(v.p_yes if signal_p_yes is None else signal_p_yes),
         jev_p_yes=v.p_yes,
         timeframe=market_timeframe(c.market, _settings()),
+        strategy_version=_settings().strategy_version,
         answerable=v.answerable, clarity=v.clarity,
         yes_ask=c.book.yes_ask, no_ask=c.book.no_ask, midpoint=c.book.midpoint,
         edge=result.edge if is_trade else None,
