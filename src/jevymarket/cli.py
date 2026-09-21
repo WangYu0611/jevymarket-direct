@@ -17,6 +17,7 @@ from .evaluation import checkpoint_for
 from .jev import JevClient, JevError, choice, noul, score
 from .market_data import ShortTermSnapshot, fetch_short_term_snapshots, watch_chainlink_anchors
 from .markets import TIMEFRAME_LABELS, Candidate, fetch_book, load_candidate, market_timeframe, scan
+from .network import ReadUnavailable, read_with_retry
 from .research import Brief, Researcher, ResearchError
 from .settlement import settle_pending_markets
 from .signal import Trade, evaluate, get_brief, market_data_and_ask, quantitative_up_probability
@@ -42,7 +43,7 @@ def _run(coro):
 
     try:
         return asyncio.run(coro)
-    except (JevError, ResearchError, PolymarketError, ValueError) as e:
+    except (JevError, ResearchError, PolymarketError, ReadUnavailable, ValueError) as e:
         console.print(f"[red]{type(e).__name__}: {e}[/]")
         raise typer.Exit(1) from None
 
@@ -63,6 +64,18 @@ def _jev(s: Settings) -> JevClient:
         timeout=s.jev_timeout_seconds,
         max_retries=s.jev_max_retries,
     )
+
+
+async def _refresh_candidate(pub, cand: Candidate, s: Settings, store: Store):
+    async def read_pair():
+        book = await fetch_book(pub, cand.market)
+        fresh_cand = Candidate(market=cand.market, book=book)
+        snapshots = await fetch_short_term_snapshots(pub, [fresh_cand], s, store=store)
+        return fresh_cand, snapshots.get(fresh_cand.slug)
+
+    # If snapshot retrieval fails, refetch the book too; never combine a book
+    # from before the retries with prices from after them.
+    return await read_with_retry(read_pair, label="刷新盘口与参考行情")
 
 
 # ---------------------------------------------------------------------------
@@ -219,12 +232,7 @@ def decide(ref: str = typer.Argument(..., help="市场 slug 或 polymarket.com U
                 state, view = await market_data_and_ask(cand, s, jev, snapshot)
                 if show_state:
                     console.print_json(json.dumps(state, ensure_ascii=False, default=str))
-                fresh_book = await fetch_book(c, cand.market)
-                fresh_cand = Candidate(market=cand.market, book=fresh_book)
-                fresh_snapshots = await fetch_short_term_snapshots(
-                    c, [fresh_cand], s, store=store
-                )
-                fresh_snapshot = fresh_snapshots.get(fresh_cand.slug)
+                fresh_cand, fresh_snapshot = await _refresh_candidate(c, cand, s, store)
                 if fresh_snapshot is None or not fresh_snapshot.trade_ready:
                     console.print(
                         f"[yellow]Jev 返回后行情已变化，跳过："
@@ -275,7 +283,7 @@ def run(
     dry_run: bool = typer.Option(False, "--dry-run", help="只评估和记录，不真实下单。"),
     max_trades: int | None = typer.Option(None, help="覆盖每轮最大交易数。"),
     limit: int = typer.Option(20, "--limit", "-n", help="本轮最多分析的候选市场数量。"),
-    loop: int | None = typer.Option(None, help="每 N 秒重复一轮。"),
+    loop: int | None = typer.Option(None, help="每轮完成后等待 N 秒，再开始下一轮。"),
     no_research: bool = typer.Option(False, "--no-research", help="兼容参数；短周期自动交易默认不使用 DeepSeek。"),
 ):
     """扫描 → 实时参考价格 → Jev 判断 → 风控 → 模拟/真实下单。"""
@@ -290,11 +298,19 @@ def run(
         settled = await settle_pending_markets(pub, s, store, limit=40)
         if settled:
             console.print(f"[dim]已自动回填 {settled} 个已结算短周期市场[/]")
-        cands = await scan(pub, s, limit=limit)
-        snapshots = await fetch_short_term_snapshots(pub, cands, s, store=store)
+        cands = await read_with_retry(
+            lambda: scan(pub, s, limit=limit), label="扫描当前市场"
+        )
+        snapshots = await read_with_retry(
+            lambda: fetch_short_term_snapshots(pub, cands, s, store=store),
+            label="获取本轮参考行情",
+        )
+        exposure = await read_with_retry(
+            lambda: ex.exposure(refresh=True), label="刷新账户敞口"
+        )
         console.rule(
             f"候选 {len(cands)} 个 | 当前敞口 "
-            f"${(await ex.exposure(refresh=True)).total:.2f} | 模拟模式={s.dry_run}"
+            f"${exposure.total:.2f} | 模拟模式={s.dry_run}"
         )
         for idx, cand in enumerate(cands, start=1):
             tf = market_timeframe(cand.market, s) or "?"
@@ -334,12 +350,13 @@ def run(
                     raise
                 continue
 
-            fresh_book = await fetch_book(pub, cand.market)
-            fresh_cand = Candidate(market=cand.market, book=fresh_book)
-            fresh_snapshots = await fetch_short_term_snapshots(
-                pub, [fresh_cand], s, store=store
-            )
-            fresh_snapshot = fresh_snapshots.get(fresh_cand.slug)
+            try:
+                fresh_cand, fresh_snapshot = await _refresh_candidate(pub, cand, s, store)
+            except ReadUnavailable as e:
+                console.print(
+                    f"  [yellow]{cand.slug}：{e}；跳过当前市场，继续其他市场[/]"
+                )
+                continue
             if fresh_snapshot is None or not fresh_snapshot.trade_ready:
                 console.print(
                     f"  [yellow]Jev 返回后行情已变化，跳过："
@@ -418,7 +435,17 @@ def run(
             async with AsyncPublicClient() as pub, _jev(s) as jev:
                 while True:
                     ex.trades_this_run = 0
-                    await one_pass(store, ex, pub, jev)
+                    try:
+                        await one_pass(store, ex, pub, jev)
+                    except ReadUnavailable as e:
+                        if loop is None:
+                            raise
+                        # Only errors explicitly produced by a read stage are
+                        # recoverable here. Never replay an uncertain live order.
+                        console.print(
+                            f"[yellow]{e}；跳过本轮，行情监听保持运行，"
+                            f"{loop}s 后重新读取[/]"
+                        )
                     if loop is None:
                         break
                     await asyncio.sleep(loop)
