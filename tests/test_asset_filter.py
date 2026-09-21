@@ -1,7 +1,8 @@
+from datetime import UTC, datetime
 from types import SimpleNamespace
 
 from jevymarket.config import Settings
-from jevymarket.markets import market_asset_symbol, market_timeframe
+from jevymarket.markets import market_asset_symbol, market_is_current, market_timeframe, market_window
 
 
 def _settings(assets: str = "BTC", timeframes: str = "5m,15m,1h") -> Settings:
@@ -56,3 +57,31 @@ def test_timeframe_whitelist_can_be_narrowed():
     s = _settings(timeframes="15m")
     assert market_timeframe(_market("Bitcoin", "btc-updown-15m-123"), s) == "15m"
     assert market_timeframe(_market("Bitcoin", "btc-updown-5m-123"), s) is None
+
+
+def test_epoch_window_parsing_and_current_filter():
+    s = _settings()
+    m = _market("Bitcoin Up or Down?", "btc-updown-5m-1789965600")
+    start, end = market_window(m, s)
+    assert start == datetime(2026, 9, 21, 4, 40, tzinfo=UTC)
+    assert end == datetime(2026, 9, 21, 4, 45, tzinfo=UTC)
+    assert market_is_current(m, s, datetime(2026, 9, 21, 4, 42, tzinfo=UTC))
+    assert not market_is_current(m, s, datetime(2026, 9, 21, 4, 46, tzinfo=UTC))
+
+
+def test_future_precreated_market_is_not_current():
+    s = _settings()
+    m = _market("Bitcoin Up or Down?", "btc-updown-5m-1790052900")
+    assert not market_is_current(m, s, datetime(2026, 9, 21, 4, 48, tzinfo=UTC))
+
+
+def test_hourly_et_slug_window():
+    s = _settings()
+    m = _market(
+        "Bitcoin Up or Down - September 21, 1AM ET",
+        "bitcoin-up-or-down-september-21-2026-1am-et",
+        'This market uses the BTC/USDT 1 hour candle and the relevant "1H" candle.',
+    )
+    start, end = market_window(m, s)
+    assert start == datetime(2026, 9, 21, 5, 0, tzinfo=UTC)
+    assert end == datetime(2026, 9, 21, 6, 0, tzinfo=UTC)
