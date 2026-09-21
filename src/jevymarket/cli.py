@@ -302,15 +302,21 @@ def run(
                 f"\n[cyan]正在分析 {idx}/{len(cands)}：BTC "
                 f"{TIMEFRAME_LABELS.get(tf, tf)}[/]  [dim]{cand.slug}[/]"
             )
-            if (
-                cand.condition_id in (await ex.exposure()).condition_ids
-                or store.has_order_for(
-                    cand.condition_id,
-                    include_dry_run=s.dry_run,
-                )
-            ):
-                console.print(f"[dim]{cand.slug}：已有持仓或挂单，跳过[/]")
+            has_live_exposure = cand.condition_id in (await ex.exposure()).condition_ids
+            has_real_order = store.has_order_for(cand.condition_id)
+            has_dry_order = store.has_order_for(
+                cand.condition_id,
+                include_dry_run=True,
+            ) and not has_real_order
+
+            if not s.dry_run and (has_live_exposure or has_real_order):
+                console.print(f"[dim]{cand.slug}：已有真实持仓或挂单，跳过[/]")
                 continue
+            if s.dry_run and has_dry_order:
+                console.print(
+                    f"[dim]{cand.slug}：已有第一笔模拟订单；"
+                    "继续分析/记录checkpoint，但不重复模拟下单[/]"
+                )
 
             snapshot = snapshots.get(cand.slug)
             _print_snapshot(snapshot)
@@ -370,15 +376,22 @@ def run(
             )
             executed = False
             if isinstance(result, Trade):
-                placed = await ex.place(fresh_cand, result)
-                executed = placed.ok
-                if not placed.ok:
-                    console.print(f"  [yellow]{_status_cn(placed.status)}：{placed.message}[/]")
-                else:
+                if s.dry_run and has_dry_order:
                     console.print(
-                        f"  [green]{_status_cn(placed.status)}[/] "
-                        f"订单ID={placed.order_id}"
+                        "  [dim]交易信号已记录；该市场已有模拟订单，不重复模拟下单[/]"
                     )
+                else:
+                    placed = await ex.place(fresh_cand, result)
+                    executed = placed.ok
+                    if not placed.ok:
+                        console.print(
+                            f"  [yellow]{_status_cn(placed.status)}：{placed.message}[/]"
+                        )
+                    else:
+                        console.print(
+                            f"  [green]{_status_cn(placed.status)}[/] "
+                            f"订单ID={placed.order_id}"
+                        )
 
             store.log_decision(
                 **_decision_row(
@@ -388,7 +401,8 @@ def run(
             )
             if ex.trades_this_run >= s.max_trades_per_run:
                 console.print("[bold]本轮交易数量已达到上限[/]")
-                break
+                if not s.dry_run:
+                    break
 
         console.print(
             f"[dim]Jev：{jev.calls} 次调用，输入 {jev.total_input_tokens} / "
