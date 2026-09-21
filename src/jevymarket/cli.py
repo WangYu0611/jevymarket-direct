@@ -189,7 +189,7 @@ def decide(ref: str = typer.Argument(..., help="市场 slug 或 polymarket.com U
     from polymarket import AsyncPublicClient
 
     async def go():
-        del no_research, fresh
+        _ = (no_research, fresh)
         store = Store(s.db_path)
         try:
             async with AsyncPublicClient() as c, _jev(s) as jev:
@@ -226,7 +226,7 @@ def run(
     loop: int | None = typer.Option(None, help="每 N 秒重复一轮。"),
     no_research: bool = typer.Option(False, "--no-research", help="兼容参数；短周期自动交易默认不使用 DeepSeek。"),
 ):
-    """扫描 → 研究 → Jev 判断 → 风控 → 模拟/真实下单。"""
+    """扫描 → 实时参考价格 → Jev 判断 → 风控 → 模拟/真实下单。"""
     s = _settings(dry_run=dry_run or None)
     if max_trades is not None:
         s.max_trades_per_run = max_trades
@@ -298,7 +298,7 @@ def run(
         )
 
     async def go():
-        del no_research
+        _ = no_research
         store = Store(s.db_path)
         ex = await Executor.create(s, store, dry_run=s.dry_run)
         watcher = asyncio.create_task(watch_chainlink_anchors(s, store))
