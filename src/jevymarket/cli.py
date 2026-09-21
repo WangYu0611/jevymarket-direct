@@ -516,10 +516,11 @@ def stats():
     )
 
     t = Table(title="概率模型对比（只统计已有官方结算结果的决策快照）")
-    for col in ("模型", "样本", "Brier↓", "LogLoss↓", "方向命中率"):
-        t.add_column(col, justify="right" if col != "模型" else "left")
+    for col in ("周期", "模型", "样本", "Brier↓", "LogLoss↓", "方向命中率"):
+        t.add_column(col, justify="right" if col not in ("周期", "模型") else "left")
     for row in st["model_comparison"]:
         t.add_row(
+            row["timeframe"],
             row["model"],
             str(row["n"]),
             _fmt_metric(row["brier"], 4),
@@ -538,10 +539,11 @@ def stats():
     )
 
     ts = Table(title="策略对照（每个市场首次满足条件时固定投入 $1；未计手续费/滑点）")
-    for col in ("策略", "交易数", "赢", "命中率", "毛PnL", "ROI"):
-        ts.add_column(col, justify="right" if col != "策略" else "left")
+    for col in ("周期", "策略", "交易数", "赢", "命中率", "毛PnL", "ROI"):
+        ts.add_column(col, justify="right" if col not in ("周期", "策略") else "left")
     for row in st["strategy_comparison"]:
         ts.add_row(
+            row["timeframe"],
             row["strategy"],
             str(row["trades"]),
             str(row["wins"]),
@@ -551,8 +553,8 @@ def stats():
         )
     console.print(ts)
 
-    t2 = Table(title="交易概率分桶 vs 当时市场中间价")
-    for col in ("概率区间", "样本数", "量化均值", "市场均值"):
+    t2 = Table(title="交易概率分桶 vs 当时市场中间价（含历史旧决策，仅作参考）")
+    for col in ("概率区间", "样本数", "交易概率均值", "市场均值"):
         t2.add_column(col, justify="right")
     for b in st["buckets"]:
         upper = min(1.0, (b["b"] + 1) / 10)
