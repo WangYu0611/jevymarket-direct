@@ -18,7 +18,7 @@ from .research import Brief, Researcher, ResearchError
 from .signal import Trade, evaluate, get_brief, research_and_ask
 from .store import Store
 
-app = typer.Typer(help="Polymarket trading bot driven by Jev (TypeSafe AI) via OpenRouter.", no_args_is_help=True)
+app = typer.Typer(help="Polymarket trading bot driven by Jev via TypeSafe + DeepSeek official APIs.", no_args_is_help=True)
 console = Console()
 log = logging.getLogger("jevymarket")
 
@@ -46,13 +46,13 @@ def _run(coro):
 def _researcher(s: Settings, enabled: bool) -> Researcher | None:
     if not (enabled and s.research_enabled):
         return None
-    return Researcher(s.openrouter_api_key, model=s.research_model, base_url=s.openrouter_base_url,
-                      max_results=s.research_max_results, max_calls=s.max_research_per_run,
+    return Researcher(s.deepseek_api_key, model=s.research_model, base_url=s.deepseek_base_url,
+                      max_searches=s.research_max_searches, max_calls=s.max_research_per_run,
                       exclude_domains=s.research_exclude_domains)
 
 
 def _jev(s: Settings) -> JevClient:
-    return JevClient(s.openrouter_api_key, model=s.jev_model, base_url=s.openrouter_base_url)
+    return JevClient(s.typesafe_api_key, model=s.jev_model, base_url=s.typesafe_base_url)
 
 
 # ---------------------------------------------------------------------------
@@ -67,7 +67,7 @@ def _root(version: bool = typer.Option(False, "--version", is_eager=True)):
 
 @app.command("jev-test")
 def jev_test(raw: bool = typer.Option(False, help="Print the raw JSON response only.")):
-    """One hard-coded Jev call through OpenRouter to verify the key and response schema."""
+    """One hard-coded Jev call through TypeSafe to verify the key and response schema."""
     s = _settings()
     state = {
         "question": "Will the sun rise in the east tomorrow?",
@@ -88,7 +88,7 @@ def jev_test(raw: bool = typer.Option(False, help="Print the raw JSON response o
     }
 
     async def go():
-        async with JevClient(s.openrouter_api_key, model=s.jev_model, base_url=s.openrouter_base_url) as jev:
+        async with JevClient(s.typesafe_api_key, model=s.jev_model, base_url=s.typesafe_base_url) as jev:
             data = await jev.decide_raw(state, questions)
             if raw:
                 print(json.dumps(data, indent=2))
@@ -134,8 +134,8 @@ def research(ref: str = typer.Argument(..., help="Market slug or polymarket.com 
 
     async def go():
         store = Store(s.db_path)
-        r = Researcher(s.openrouter_api_key, model=s.research_model, base_url=s.openrouter_base_url,
-                       max_results=s.research_max_results, exclude_domains=s.research_exclude_domains)
+        r = Researcher(s.deepseek_api_key, model=s.research_model, base_url=s.deepseek_base_url,
+                       max_searches=s.research_max_searches, exclude_domains=s.research_exclude_domains)
         async with AsyncPublicClient() as c, r:
             cand = await load_candidate(c, s, ref)
             brief, cached = await get_brief(cand, s, store, r, fresh=fresh)
@@ -221,9 +221,9 @@ def run(
             if ex.trades_this_run >= s.max_trades_per_run:
                 console.print("[bold]trade cap for this run reached[/]")
                 break
-        spend = f"Jev: {jev.calls} calls, {jev.total_input_tokens} tokens, ${jev.total_cost:.5f}"
+        spend = f"Jev: {jev.calls} calls, {jev.total_input_tokens} in/{jev.total_output_tokens} out tokens"
         if r:
-            spend += f" | researcher: {r.calls} briefs, ${r.total_cost:.4f}"
+            spend += f" | researcher: {r.calls} briefs, {r.total_input_tokens} in/{r.total_output_tokens} out tokens"
         console.print(f"[dim]{spend}[/]")
 
     async def go():
@@ -300,12 +300,12 @@ def positions():
 
 @app.command()
 def stats():
-    """Decision/order counts, Jev spend, and a rough Jev-vs-market calibration table."""
+    """Decision/order counts and a rough Jev-vs-market calibration table."""
     s = _settings()
     st = Store(s.db_path).stats()
-    console.print(f"decisions={st['decisions']} trade_signals={st['trade_signals']} "
-                  f"jev_cost=${st['jev_cost_usd']:.5f} briefs={st['briefs']} research_cost=${st['research_cost_usd']:.4f} "
-                  f"live_orders={st['live_orders']} live_usd=${st['live_usd']:.2f}")
+    console.print(f"decisions={st['decisions']} trade_signals={st['trade_signals']} briefs={st['briefs']} "
+                  f"live_orders={st['live_orders']} live_usd=${st['live_usd']:.2f} "
+                  "provider_cost=n/a (direct APIs report tokens, not per-request cost)")
     t = Table(title="Jev P(yes) buckets vs market midpoint")
     for col in ("bucket", "n", "avg jev", "avg market"):
         t.add_column(col, justify="right")
@@ -327,7 +327,7 @@ def _fmt(x: float | None) -> str:
 
 
 def _print_brief(b: Brief, cached: bool, full: bool = False) -> None:
-    tag = "cached" if cached else f"${b.cost:.4f}"
+    tag = "cached" if cached else "direct API"
     console.print(f"  [cyan]evidence[/] as of {b.as_of or '?'} ({b.model or 'researcher'}, {tag}): {b.summary}")
     if not full:
         return
@@ -348,7 +348,7 @@ def _print_decision(c: Candidate, v, result, brief: Brief | None = None, cached:
             f"  market yes bid/ask {_fmt(c.book.yes_bid)}/{_fmt(c.book.yes_ask)}  no ask {_fmt(c.book.no_ask)}  "
             f"days={c.days_to_resolution}\n"
             f"  Jev: p_yes={v.p_yes:.2f} answerable={v.answerable:.2f} clarity={v.clarity_mean} "
-            f"(conf {v.clarity_confidence}) cost=${v.cost:.6f}")
+            f"(conf {v.clarity_confidence})")
     console.print(head)
     if brief is not None:
         _print_brief(brief, cached)
