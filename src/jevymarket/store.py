@@ -58,13 +58,14 @@ CREATE TABLE IF NOT EXISTS orders (
 CREATE INDEX IF NOT EXISTS idx_decisions_slug ON decisions(slug);
 CREATE INDEX IF NOT EXISTS idx_orders_condition ON orders(condition_id);
 CREATE TABLE IF NOT EXISTS price_anchors (
-    slug TEXT PRIMARY KEY,
+    slug TEXT NOT NULL,
     timeframe TEXT NOT NULL,
     window_start REAL NOT NULL,
     twap_window INTEGER NOT NULL,
     price REAL NOT NULL,
     observed_ts REAL NOT NULL,
-    source TEXT NOT NULL
+    source TEXT NOT NULL,
+    PRIMARY KEY (slug, twap_window)
 );
 CREATE INDEX IF NOT EXISTS idx_price_anchors_start ON price_anchors(window_start);
 """
@@ -82,7 +83,32 @@ class Store:
         cols = {r["name"] for r in self.conn.execute("PRAGMA table_info(decisions)")}
         if "research_cost" not in cols:
             self.conn.execute("ALTER TABLE decisions ADD COLUMN research_cost REAL")
-            self.conn.commit()
+
+        anchor_info = self.conn.execute("PRAGMA table_info(price_anchors)").fetchall()
+        pk_cols = [r["name"] for r in sorted(anchor_info, key=lambda row: row["pk"]) if r["pk"]]
+        if anchor_info and pk_cols == ["slug"]:
+            self.conn.executescript(
+                """
+                ALTER TABLE price_anchors RENAME TO price_anchors_old;
+                CREATE TABLE price_anchors (
+                    slug TEXT NOT NULL,
+                    timeframe TEXT NOT NULL,
+                    window_start REAL NOT NULL,
+                    twap_window INTEGER NOT NULL,
+                    price REAL NOT NULL,
+                    observed_ts REAL NOT NULL,
+                    source TEXT NOT NULL,
+                    PRIMARY KEY (slug, twap_window)
+                );
+                INSERT OR IGNORE INTO price_anchors
+                SELECT slug, timeframe, window_start, twap_window, price, observed_ts, source
+                FROM price_anchors_old;
+                DROP TABLE price_anchors_old;
+                CREATE INDEX IF NOT EXISTS idx_price_anchors_start
+                ON price_anchors(window_start);
+                """
+            )
+        self.conn.commit()
 
     def close(self) -> None:
         self.conn.close()
@@ -133,13 +159,13 @@ class Store:
         self.conn.commit()
         return cur.rowcount > 0
 
-    def get_price_anchor(self, slug: str) -> dict | None:
+    def get_price_anchor(self, slug: str, twap_window: int) -> dict | None:
         row = self.conn.execute(
             """
             SELECT slug, timeframe, window_start, twap_window, price, observed_ts, source
-            FROM price_anchors WHERE slug = ?
+            FROM price_anchors WHERE slug = ? AND twap_window = ?
             """,
-            (slug,),
+            (slug, twap_window),
         ).fetchone()
         return dict(row) if row is not None else None
 
