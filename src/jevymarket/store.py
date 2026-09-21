@@ -57,6 +57,16 @@ CREATE TABLE IF NOT EXISTS orders (
 );
 CREATE INDEX IF NOT EXISTS idx_decisions_slug ON decisions(slug);
 CREATE INDEX IF NOT EXISTS idx_orders_condition ON orders(condition_id);
+CREATE TABLE IF NOT EXISTS price_anchors (
+    slug TEXT PRIMARY KEY,
+    timeframe TEXT NOT NULL,
+    window_start REAL NOT NULL,
+    twap_window INTEGER NOT NULL,
+    price REAL NOT NULL,
+    observed_ts REAL NOT NULL,
+    source TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_price_anchors_start ON price_anchors(window_start);
 """
 
 
@@ -97,6 +107,41 @@ class Store:
         cur = self.conn.execute(f"INSERT INTO orders ({cols}) VALUES ({qs})", tuple(row.values()))
         self.conn.commit()
         return int(cur.lastrowid)
+
+    # --- authoritative short-term reference anchors ---------------------------
+
+    def put_price_anchor(
+        self,
+        *,
+        slug: str,
+        timeframe: str,
+        window_start: float,
+        twap_window: int,
+        price: float,
+        observed_ts: float,
+        source: str,
+    ) -> bool:
+        """Persist the first trusted Chainlink anchor for a recurring market."""
+        cur = self.conn.execute(
+            """
+            INSERT OR IGNORE INTO price_anchors
+            (slug, timeframe, window_start, twap_window, price, observed_ts, source)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (slug, timeframe, window_start, twap_window, price, observed_ts, source),
+        )
+        self.conn.commit()
+        return cur.rowcount > 0
+
+    def get_price_anchor(self, slug: str) -> dict | None:
+        row = self.conn.execute(
+            """
+            SELECT slug, timeframe, window_start, twap_window, price, observed_ts, source
+            FROM price_anchors WHERE slug = ?
+            """,
+            (slug,),
+        ).fetchone()
+        return dict(row) if row is not None else None
 
     # --- research cache ------------------------------------------------------
 
