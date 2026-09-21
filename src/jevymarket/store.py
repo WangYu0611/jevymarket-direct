@@ -494,6 +494,7 @@ class Store:
         return sum((p >= 0.5) == bool(y) for p, y in values) / len(values)
 
     def model_comparison(self) -> list[dict[str, Any]]:
+        """Compare all probability models on the exact same quantitative-era snapshots."""
         rows = self.conn.execute(
             """
             SELECT d.id, d.state_json, d.jev_p_yes, d.midpoint,
@@ -504,35 +505,55 @@ class Store:
             """
         ).fetchall()
 
-        by_model: dict[str, list[tuple[float, int]]] = {
-            "量化 Φ(Z)": [],
-            "Jev": [],
-            "Polymarket": [],
+        scopes = ("全部", "5m", "15m", "1h")
+        model_names = ("量化 Φ(Z)", "Jev", "Polymarket")
+        by_scope: dict[str, dict[str, list[tuple[float, int]]]] = {
+            scope: {name: [] for name in model_names}
+            for scope in scopes
         }
+
         for row in rows:
-            y = int(row["up_won"])
             try:
                 state = json.loads(row["state_json"] or "{}")
             except (TypeError, json.JSONDecodeError):
-                state = {}
+                continue
             quant = state.get("quantitative_signal")
             p_quant = quant.get("p_up") if isinstance(quant, dict) else None
-            if isinstance(p_quant, (int, float)):
-                by_model["量化 Φ(Z)"].append((float(p_quant), y))
-            if isinstance(row["jev_p_yes"], (int, float)):
-                by_model["Jev"].append((float(row["jev_p_yes"]), y))
-            if isinstance(row["midpoint"], (int, float)):
-                by_model["Polymarket"].append((float(row["midpoint"]), y))
+            if not isinstance(p_quant, (int, float)):
+                # Same-sample comparison: old pre-quantitative snapshots are excluded.
+                continue
+            if not isinstance(row["jev_p_yes"], (int, float)):
+                continue
+            if not isinstance(row["midpoint"], (int, float)):
+                continue
+
+            y = int(row["up_won"])
+            timeframe = row["timeframe"]
+            target_scopes = ["全部"]
+            if timeframe in {"5m", "15m", "1h"}:
+                target_scopes.append(str(timeframe))
+
+            values = {
+                "量化 Φ(Z)": float(p_quant),
+                "Jev": float(row["jev_p_yes"]),
+                "Polymarket": float(row["midpoint"]),
+            }
+            for scope in target_scopes:
+                for name, p in values.items():
+                    by_scope[scope][name].append((p, y))
 
         out = []
-        for name, values in by_model.items():
-            out.append({
-                "model": name,
-                "n": len(values),
-                "brier": self._brier(values),
-                "log_loss": self._log_loss(values),
-                "accuracy": self._direction_accuracy(values),
-            })
+        for scope in scopes:
+            for name in model_names:
+                values = by_scope[scope][name]
+                out.append({
+                    "timeframe": scope,
+                    "model": name,
+                    "n": len(values),
+                    "brier": self._brier(values),
+                    "log_loss": self._log_loss(values),
+                    "accuracy": self._direction_accuracy(values),
+                })
         return out
 
     def strategy_comparison(
@@ -544,11 +565,11 @@ class Store:
         min_trade_price: float,
         max_trade_price: float,
     ) -> list[dict[str, Any]]:
-        """One hypothetical $1 trade per market, using the first qualifying snapshot."""
+        """First qualifying $1 trade per market, split by horizon and overall."""
         rows = self.conn.execute(
             """
             SELECT d.slug, d.ts, d.state_json, d.jev_p_yes, d.answerable,
-                   d.clarity, d.yes_ask, d.no_ask, r.up_won
+                   d.clarity, d.yes_ask, d.no_ask, d.timeframe, r.up_won
             FROM decisions d
             JOIN market_results r ON r.slug = d.slug
             ORDER BY d.ts
@@ -560,8 +581,15 @@ class Store:
             ("B Φ(Z)+Jev门控", "quant", True),
             ("C Jev概率", "jev", True),
         )
+        scopes = ("全部", "5m", "15m", "1h")
         state = {
-            name: {"seen": set(), "trades": 0, "wins": 0, "pnl": 0.0}
+            (scope, name): {
+                "seen": set(),
+                "trades": 0,
+                "wins": 0,
+                "pnl": 0.0,
+            }
+            for scope in scopes
             for name, _, _ in configs
         }
 
@@ -571,15 +599,9 @@ class Store:
             no_ask: float | None,
         ) -> tuple[str, float] | None:
             choices: list[tuple[str, float, float]] = []
-            if (
-                yes_ask is not None
-                and min_trade_price <= yes_ask <= max_trade_price
-            ):
+            if yes_ask is not None and min_trade_price <= yes_ask <= max_trade_price:
                 choices.append(("UP", yes_ask, p_up - yes_ask))
-            if (
-                no_ask is not None
-                and min_trade_price <= no_ask <= max_trade_price
-            ):
+            if no_ask is not None and min_trade_price <= no_ask <= max_trade_price:
                 choices.append(("DOWN", no_ask, (1.0 - p_up) - no_ask))
             if not choices:
                 return None
@@ -590,59 +612,70 @@ class Store:
             try:
                 decision_state = json.loads(row["state_json"] or "{}")
             except (TypeError, json.JSONDecodeError):
-                decision_state = {}
+                continue
             quant = decision_state.get("quantitative_signal")
             quant_p = quant.get("p_up") if isinstance(quant, dict) else None
+            # Keep A/B/C on exactly the same quantitative-era opportunity set.
+            if not isinstance(quant_p, (int, float)):
+                continue
+
             jev_p = row["jev_p_yes"]
             yes_ask = float(row["yes_ask"]) if row["yes_ask"] is not None else None
             no_ask = float(row["no_ask"]) if row["no_ask"] is not None else None
             up_won = bool(row["up_won"])
+            timeframe = str(row["timeframe"] or "")
+            target_scopes = ["全部"]
+            if timeframe in {"5m", "15m", "1h"}:
+                target_scopes.append(timeframe)
 
-            for name, probability_kind, use_gate in configs:
-                bucket = state[name]
-                if row["slug"] in bucket["seen"]:
-                    continue
+            for scope in target_scopes:
+                for name, probability_kind, use_gate in configs:
+                    bucket = state[(scope, name)]
+                    if row["slug"] in bucket["seen"]:
+                        continue
 
-                if use_gate and (
-                    row["answerable"] is None
-                    or float(row["answerable"]) < min_answerable
-                    or row["clarity"] is None
-                    or int(row["clarity"]) < min_clarity
-                ):
-                    continue
+                    if use_gate and (
+                        row["answerable"] is None
+                        or float(row["answerable"]) < min_answerable
+                        or row["clarity"] is None
+                        or int(row["clarity"]) < min_clarity
+                    ):
+                        continue
 
-                p = quant_p if probability_kind == "quant" else jev_p
-                if not isinstance(p, (int, float)):
-                    continue
+                    p = quant_p if probability_kind == "quant" else jev_p
+                    if not isinstance(p, (int, float)):
+                        continue
 
-                trade = choose_trade(float(p), yes_ask, no_ask)
-                if trade is None:
-                    continue
+                    trade = choose_trade(float(p), yes_ask, no_ask)
+                    if trade is None:
+                        continue
 
-                side, ask = trade
-                bucket["seen"].add(row["slug"])
-                bucket["trades"] += 1
-                won = up_won if side == "UP" else not up_won
-                if won:
-                    bucket["wins"] += 1
-                    bucket["pnl"] += (1.0 / ask) - 1.0
-                else:
-                    bucket["pnl"] -= 1.0
+                    side, ask = trade
+                    bucket["seen"].add(row["slug"])
+                    bucket["trades"] += 1
+                    won = up_won if side == "UP" else not up_won
+                    if won:
+                        bucket["wins"] += 1
+                        bucket["pnl"] += (1.0 / ask) - 1.0
+                    else:
+                        bucket["pnl"] -= 1.0
 
         out: list[dict[str, Any]] = []
-        for name, _, _ in configs:
-            bucket = state[name]
-            trades = int(bucket["trades"])
-            wins = int(bucket["wins"])
-            pnl = float(bucket["pnl"])
-            out.append({
-                "strategy": name,
-                "trades": trades,
-                "wins": wins,
-                "hit_rate": wins / trades if trades else None,
-                "pnl_usd": pnl,
-                "roi": pnl / trades if trades else None,
-            })
+        for scope in scopes:
+            for name, _, _ in configs:
+                bucket = state[(scope, name)]
+                trades = int(bucket["trades"])
+                wins = int(bucket["wins"])
+                pnl = float(bucket["pnl"])
+                out.append({
+                    "timeframe": scope,
+                    "strategy": name,
+                    "trades": trades,
+                    "wins": wins,
+                    "hit_rate": wins / trades if trades else None,
+                    "pnl_usd": pnl,
+                    "roi": pnl / trades if trades else None,
+                })
         return out
 
     def dry_run_performance(self) -> dict[str, Any]:
