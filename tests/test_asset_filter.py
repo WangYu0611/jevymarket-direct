@@ -13,7 +13,7 @@ def _market(question: str, slug: str = "", category: str = "", tags=()):
         question=question,
         slug=slug,
         category=category,
-        tags=tuple(SimpleNamespace(slug=s, label=l) for s, l in tags),
+        tags=tuple(SimpleNamespace(slug=slug, label=label) for slug, label in tags),
     )
 
 
