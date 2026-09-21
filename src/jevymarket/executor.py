@@ -145,7 +145,9 @@ class Executor:
             self.store.log_order(
                 slug=c.slug, condition_id=c.condition_id, token_id=t.token_id, outcome=t.outcome,
                 side=t.side, price=t.price, size=t.size, usd=t.usd, order_id=None,
-                status="dry_run", dry_run=1, response_json=None,
+                status="dry_run", dry_run=1,
+                strategy_version=self.s.strategy_version,
+                response_json=None,
             )
             log.info("模拟下单：买入 %s %s 份 @ %.3f（$%.2f），市场=%s", t.outcome, t.size, t.price, t.usd, c.slug)
             return Placed(ok=True, order_id=None, status="dry_run")
@@ -160,7 +162,9 @@ class Executor:
             self.store.log_order(
                 slug=c.slug, condition_id=c.condition_id, token_id=t.token_id, outcome=t.outcome,
                 side=t.side, price=t.price, size=t.size, usd=t.usd, order_id=str(resp.order_id),
-                status=str(resp.status or "live"), dry_run=0, response_json=resp.model_dump(),
+                status=str(resp.status or "live"), dry_run=0,
+                strategy_version=self.s.strategy_version,
+                response_json=resp.model_dump(),
             )
             log.info("已提交 %s：买入 %s %.2f 份 @ %.3f（$%.2f），订单=%s，状态=%s", c.slug, t.outcome, t.size, t.price, t.usd, resp.order_id, resp.status)
             return Placed(ok=True, order_id=str(resp.order_id), status=str(resp.status or "live"), raw=resp.model_dump())
@@ -168,7 +172,9 @@ class Executor:
         self.store.log_order(
             slug=c.slug, condition_id=c.condition_id, token_id=t.token_id, outcome=t.outcome,
             side=t.side, price=t.price, size=t.size, usd=t.usd, order_id=None,
-            status="rejected", dry_run=0, response_json=resp.model_dump(),
+            status="rejected", dry_run=0,
+            strategy_version=self.s.strategy_version,
+            response_json=resp.model_dump(),
         )
         log.warning("交易所拒绝 %s：%s %s", c.slug, resp.code, resp.message)
         return Placed(ok=False, order_id=None, status="rejected", message=f"{resp.code}: {resp.message}", raw=resp.model_dump())
