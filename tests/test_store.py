@@ -81,6 +81,7 @@ def test_resolved_model_and_strategy_metrics(tmp_path):
         order_id=None,
         status="dry_run",
         dry_run=1,
+        strategy_version="v2",
     )
     st.log_order(
         slug=slug,
@@ -136,6 +137,8 @@ def test_evaluation_checkpoint_is_unique_per_version(tmp_path):
         seconds_left=115,
         quant_p=0.6,
         jev_p=0.55,
+        jev_answerable=0.9,
+        jev_clarity=3,
         market_p=0.58,
         yes_ask=0.59,
         no_ask=0.42,
@@ -149,4 +152,185 @@ def test_evaluation_checkpoint_is_unique_per_version(tmp_path):
     kwargs["strategy_version"] = "v3"
     assert st.log_evaluation_sample(**kwargs)
     assert st.evaluation_sample_count() == 2
+    st.close()
+
+
+
+def test_clear_experiment_data_preserves_authoritative_and_live_data(tmp_path):
+    st = Store(tmp_path / "t.db")
+    st.log_decision(
+        slug="old",
+        condition_id="c-old",
+        p_yes=0.5,
+        action="skip",
+        strategy_version="legacy",
+        state_json={},
+        raw_json={},
+    )
+    st.log_evaluation_sample(
+        slug="old",
+        condition_id="c-old",
+        timeframe="5m",
+        strategy_version="v2",
+        checkpoint_seconds=120,
+        seconds_left=118,
+        quant_p=0.5,
+        jev_p=0.5,
+        jev_answerable=0.9,
+        jev_clarity=3,
+        market_p=0.5,
+        yes_ask=0.51,
+        no_ask=0.50,
+        book_json={},
+        state_json={},
+    )
+    st.log_order(
+        slug="old",
+        condition_id="c-old",
+        token_id="up",
+        outcome="UP",
+        side="BUY",
+        price=0.5,
+        size=2,
+        usd=1,
+        order_id=None,
+        status="dry_run",
+        dry_run=1,
+        strategy_version="v2",
+    )
+    st.log_order(
+        slug="live",
+        condition_id="c-live",
+        token_id="up",
+        outcome="UP",
+        side="BUY",
+        price=0.5,
+        size=2,
+        usd=1,
+        order_id="live-1",
+        status="live",
+        dry_run=0,
+        strategy_version="v2",
+    )
+    st.put_market_result(
+        slug="old",
+        condition_id="c-old",
+        timeframe="5m",
+        winner="UP",
+        up_won=True,
+        up_final_price=1.0,
+        down_final_price=0.0,
+        source="official",
+    )
+    st.put_price_anchor(
+        slug="btc-updown-5m-1",
+        timeframe="5m",
+        window_start=1.0,
+        twap_window=60,
+        price=100.0,
+        observed_ts=1.0,
+        source="test",
+    )
+    st.put_price_sample(
+        source="chainlink_spot",
+        price=100.0,
+        observed_ts=time.time(),
+    )
+
+    counts = st.clear_experiment_data()
+    assert counts == {
+        "decisions": 1,
+        "evaluation_samples": 1,
+        "dry_run_orders": 1,
+    }
+    assert st.conn.execute("SELECT COUNT(*) FROM decisions").fetchone()[0] == 0
+    assert st.evaluation_sample_count() == 0
+    assert st.conn.execute(
+        "SELECT COUNT(*) FROM orders WHERE dry_run = 1"
+    ).fetchone()[0] == 0
+    assert st.conn.execute(
+        "SELECT COUNT(*) FROM orders WHERE dry_run = 0"
+    ).fetchone()[0] == 1
+    assert st.get_market_result("old") is not None
+    assert st.get_price_anchor("btc-updown-5m-1", 60) is not None
+    assert st.get_price_samples(
+        source="chainlink_spot",
+        since_ts=time.time() - 60,
+    )
+    st.close()
+
+
+def test_experiment_stats_are_version_isolated(tmp_path):
+    st = Store(tmp_path / "t.db")
+    st.put_market_result(
+        slug="m-v2",
+        condition_id="c-v2",
+        timeframe="5m",
+        winner="UP",
+        up_won=True,
+        up_final_price=1.0,
+        down_final_price=0.0,
+        source="official",
+    )
+    st.put_market_result(
+        slug="m-old",
+        condition_id="c-old",
+        timeframe="5m",
+        winner="DOWN",
+        up_won=False,
+        up_final_price=0.0,
+        down_final_price=1.0,
+        source="official",
+    )
+
+    for version, slug, quant_p, jev_p, market_p in (
+        ("v2", "m-v2", 0.8, 0.7, 0.75),
+        ("legacy", "m-old", 0.9, 0.9, 0.9),
+    ):
+        st.log_decision(
+            slug=slug,
+            condition_id=f"c-{version}",
+            p_yes=quant_p,
+            jev_p_yes=jev_p,
+            timeframe="5m",
+            strategy_version=version,
+            answerable=0.9,
+            clarity=3,
+            yes_ask=0.6,
+            no_ask=0.41,
+            midpoint=market_p,
+            action="skip",
+            state_json={"quantitative_signal": {"p_up": quant_p}},
+            raw_json={},
+        )
+        st.log_evaluation_sample(
+            slug=slug,
+            condition_id=f"c-{version}",
+            timeframe="5m",
+            strategy_version=version,
+            checkpoint_seconds=120,
+            seconds_left=120,
+            quant_p=quant_p,
+            jev_p=jev_p,
+            jev_answerable=0.9,
+            jev_clarity=3,
+            market_p=market_p,
+            yes_ask=0.6,
+            no_ask=0.41,
+            book_json={},
+            state_json={},
+        )
+
+    stats = st.experiment_stats("v2")
+    assert stats["strategy_version"] == "v2"
+    assert stats["evaluation_samples"] == 1
+    assert stats["resolved_markets"] == 1
+
+    overall = {
+        row["model"]: row
+        for row in stats["model_comparison"]
+        if row["timeframe"] == "全部"
+    }
+    assert overall["量化 Φ(Z)"]["n"] == 1
+    assert abs(overall["量化 Φ(Z)"]["brier"] - 0.04) < 1e-9
     st.close()
