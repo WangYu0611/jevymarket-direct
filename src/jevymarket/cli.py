@@ -13,7 +13,7 @@ from rich.table import Table
 from . import __version__
 from .config import Settings, load_settings
 from .jev import JevClient, JevError, choice, noul, score
-from .market_data import ShortTermSnapshot, fetch_short_term_snapshots
+from .market_data import fetch_short_term_snapshots
 from .markets import TIMEFRAME_LABELS, Candidate, load_candidate, market_timeframe, scan
 from .research import Brief, Researcher, ResearchError
 from .signal import Trade, evaluate, get_brief, research_and_ask
@@ -367,7 +367,8 @@ def _fmt_usd(x: float | None) -> str:
 def _fmt_delta(x: float | None) -> str:
     if x is None:
         return "—"
-    return f"{x:+,.2f}"
+    sign = "+" if x >= 0 else "-"
+    return f"{sign}${abs(x):,.2f}"
 
 
 def _fmt_seconds(seconds: int | None) -> str:
