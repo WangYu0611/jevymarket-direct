@@ -71,13 +71,12 @@ class Executor:
                 private_key=settings.polymarket_private_key,
                 wallet=settings.polymarket_wallet or None,
             )
-            log.info("wallet %s (%s) dry_run=%s", client.wallet, client.wallet_type, dry_run)
+            log.info("钱包 %s（%s），模拟模式=%s", client.wallet, client.wallet_type, dry_run)
             return cls(client, str(client.wallet), settings, store, dry_run)
         if not dry_run:
-            raise ValueError("POLYMARKET_PRIVATE_KEY must be a 32-byte hex key to trade live "
-                             "(a 0x…40-hex value is an address, not a key)")
+            raise ValueError("真实交易需要 32 字节十六进制 POLYMARKET_PRIVATE_KEY；0x…40 位的是地址，不是私钥")
         wallet = settings.polymarket_wallet or None
-        log.info("no private key: dry-run with address-only exposure for %s", wallet or "<no wallet>")
+        log.info("未配置私钥：以只读地址模式进行模拟交易，钱包=%s", wallet or "<未配置钱包>")
         return cls(AsyncPublicClient(), wallet, settings, store, dry_run)
 
     async def close(self) -> None:
@@ -112,7 +111,7 @@ class Executor:
             # balance is in USDC base units (6 dp) as a string/Decimal
             return float(ba.balance) / 1e6
         except Exception as e:  # noqa: BLE001
-            log.warning("balance lookup failed: %s", e)
+            log.warning("查询余额失败：%s", e)
             return None
 
     # --- guards ------------------------------------------------------------
@@ -120,16 +119,16 @@ class Executor:
     async def check(self, c: Candidate, t: Trade) -> str | None:
         """Return a refusal reason or None if the trade may go ahead."""
         if self.trades_this_run >= self.s.max_trades_per_run:
-            return f"max_trades_per_run={self.s.max_trades_per_run} reached"
+            return f"本轮最大交易数 {self.s.max_trades_per_run} 已达到"
         if t.usd > self.s.max_usd_per_trade * 1.5:
-            return f"${t.usd:.2f} exceeds per-trade cap"
+            return f"${t.usd:.2f} 超过单笔交易上限"
         if self.store.has_order_for(c.condition_id):
-            return "already ordered on this market (db)"
+            return "数据库记录显示该市场已经下过单"
         ex = await self.exposure()
         if c.condition_id in ex.condition_ids:
-            return "already exposed to this market (chain)"
+            return "链上已有该市场敞口"
         if ex.total + t.usd > self.s.max_open_exposure_usd:
-            return f"exposure ${ex.total:.2f} + ${t.usd:.2f} > cap ${self.s.max_open_exposure_usd:.2f}"
+            return f"当前敞口 ${ex.total:.2f} + 本单 ${t.usd:.2f} > 上限 ${self.s.max_open_exposure_usd:.2f}"
         return None
 
     # --- action ------------------------------------------------------------
@@ -137,7 +136,7 @@ class Executor:
     async def place(self, c: Candidate, t: Trade) -> Placed:
         refusal = await self.check(c, t)
         if refusal:
-            log.info("refuse %s: %s", c.slug, refusal)
+            log.info("拒绝下单 %s：%s", c.slug, refusal)
             return Placed(ok=False, order_id=None, status="refused", message=refusal)
 
         if self.dry_run:
@@ -148,7 +147,7 @@ class Executor:
                 side=t.side, price=t.price, size=t.size, usd=t.usd, order_id=None,
                 status="dry_run", dry_run=1, response_json=None,
             )
-            log.info("DRY RUN: would BUY %s %s x%.2f @ %.3f ($%.2f) on %s", t.size, t.outcome, t.size, t.price, t.usd, c.slug)
+            log.info("模拟下单：买入 %s %s 份 @ %.3f（$%.2f），市场=%s", t.outcome, t.size, t.price, t.usd, c.slug)
             return Placed(ok=True, order_id=None, status="dry_run")
 
         assert isinstance(self.client, AsyncSecureClient)
@@ -163,7 +162,7 @@ class Executor:
                 side=t.side, price=t.price, size=t.size, usd=t.usd, order_id=str(resp.order_id),
                 status=str(resp.status or "live"), dry_run=0, response_json=resp.model_dump(),
             )
-            log.info("PLACED %s: BUY %s x%.2f @ %.3f ($%.2f) id=%s status=%s", c.slug, t.outcome, t.size, t.price, t.usd, resp.order_id, resp.status)
+            log.info("已提交 %s：买入 %s %.2f 份 @ %.3f（$%.2f），订单=%s，状态=%s", c.slug, t.outcome, t.size, t.price, t.usd, resp.order_id, resp.status)
             return Placed(ok=True, order_id=str(resp.order_id), status=str(resp.status or "live"), raw=resp.model_dump())
         assert isinstance(resp, RejectedOrder)
         self.store.log_order(
@@ -171,7 +170,7 @@ class Executor:
             side=t.side, price=t.price, size=t.size, usd=t.usd, order_id=None,
             status="rejected", dry_run=0, response_json=resp.model_dump(),
         )
-        log.warning("REJECTED %s: %s %s", c.slug, resp.code, resp.message)
+        log.warning("交易所拒绝 %s：%s %s", c.slug, resp.code, resp.message)
         return Placed(ok=False, order_id=None, status="rejected", message=f"{resp.code}: {resp.message}", raw=resp.model_dump())
 
     def _bump_exposure(self, c: Candidate, t: Trade) -> None:
