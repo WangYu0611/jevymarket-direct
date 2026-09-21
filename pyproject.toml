@@ -1,0 +1,60 @@
+[project]
+name = "jevymarket"
+version = "0.1.0"
+description = "Polymarket trading bot driven by Jev (TypeSafe AI's System One decision model) via OpenRouter"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Markus Haas" }]
+requires-python = ">=3.12"
+keywords = ["polymarket", "prediction-markets", "trading-bot", "jev", "typesafe", "openrouter"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Office/Business :: Financial :: Investment",
+]
+dependencies = [
+    "polymarket-client",
+    "httpx>=0.27",
+    "pydantic>=2.7",
+    "pydantic-settings>=2.3",
+    "typer>=0.12",
+    "rich>=13",
+]
+
+[project.urls]
+Homepage = "https://github.com/markusbug/jevymarket"
+Repository = "https://github.com/markusbug/jevymarket"
+Issues = "https://github.com/markusbug/jevymarket/issues"
+
+[project.scripts]
+jevymarket = "jevymarket.cli:app"
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=0.23",
+    "respx>=0.21",
+    "ruff>=0.6",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
+ignore = ["E501"]
+
+[build-system]
+requires = ["uv_build>=0.11.7,<0.12.0"]
+build-backend = "uv_build"
