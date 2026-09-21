@@ -97,13 +97,19 @@ def test_resolved_model_and_strategy_metrics(tmp_path):
     )
 
     stats = st.stats()
-    by_model = {row["model"]: row for row in stats["model_comparison"]}
+    by_model = {
+        row["model"]: row
+        for row in stats["model_comparison"]
+        if row["timeframe"] == "全部"
+    }
     assert abs(by_model["量化 Φ(Z)"]["brier"] - 0.04) < 1e-9
     assert abs(by_model["Jev"]["brier"] - 0.16) < 1e-9
     assert abs(by_model["Polymarket"]["brier"] - 0.09) < 1e-9
 
     by_strategy = {
-        row["strategy"]: row for row in stats["strategy_comparison"]
+        row["strategy"]: row
+        for row in stats["strategy_comparison"]
+        if row["timeframe"] == "全部"
     }
     assert by_strategy["A 纯Φ(Z)"]["trades"] == 1
     assert by_strategy["A 纯Φ(Z)"]["wins"] == 1
