@@ -504,8 +504,14 @@ def positions():
 
 
 @app.command()
-def stats():
-    """自动回填结算结果，并显示概率质量与模拟交易表现。"""
+def stats(
+    all_history: bool = typer.Option(
+        False,
+        "--all",
+        help="显示全部历史混合数据；默认只统计当前策略版本的固定checkpoint样本。",
+    ),
+):
+    """自动回填结算结果，并显示当前实验或全部历史统计。"""
     s = _settings()
     from polymarket import AsyncPublicClient
 
@@ -516,13 +522,24 @@ def stats():
                 settled = await settle_pending_markets(
                     client, s, store, limit=500, grace_seconds=15.0
                 )
-            return settled, store.stats(
-                min_edge=s.min_edge,
-                min_answerable=s.min_answerable,
-                min_clarity=s.min_clarity,
-                min_trade_price=s.min_trade_price,
-                max_trade_price=s.max_trade_price,
-            )
+            if all_history:
+                st = store.stats(
+                    min_edge=s.min_edge,
+                    min_answerable=s.min_answerable,
+                    min_clarity=s.min_clarity,
+                    min_trade_price=s.min_trade_price,
+                    max_trade_price=s.max_trade_price,
+                )
+            else:
+                st = store.experiment_stats(
+                    s.strategy_version,
+                    min_edge=s.min_edge,
+                    min_answerable=s.min_answerable,
+                    min_clarity=s.min_clarity,
+                    min_trade_price=s.min_trade_price,
+                    max_trade_price=s.max_trade_price,
+                )
+            return settled, st
         finally:
             store.close()
 
@@ -530,23 +547,34 @@ def stats():
     if settled:
         console.print(f"[green]本次新增回填 {settled} 个已结算市场[/]")
 
-    console.print(
-        f"决策数={st['decisions']} 交易信号={st['trade_signals']} "
-        f"已结算市场={st['resolved_markets']} 模拟订单={st['dry_orders']} "
-        f"固定checkpoint样本={st['evaluation_samples']} "
-        f"真实订单={st['live_orders']} 真实金额=${st['live_usd']:.2f}"
-    )
-    if st["strategy_versions"]:
+    if all_history:
+        console.print("[yellow]统计范围：全部历史数据（可能包含旧策略版本）[/]")
         console.print(
-            "[dim]策略版本："
-            + "；".join(
-                f"{row['strategy_version']}={row['n']}"
-                for row in st["strategy_versions"]
+            f"决策数={st['decisions']} 交易信号={st['trade_signals']} "
+            f"已结算市场={st['resolved_markets']} 模拟订单={st['dry_orders']} "
+            f"固定checkpoint样本={st['evaluation_samples']} "
+            f"真实订单={st['live_orders']} 真实金额=${st['live_usd']:.2f}"
+        )
+        if st["strategy_versions"]:
+            console.print(
+                "[dim]策略版本："
+                + "；".join(
+                    f"{row['strategy_version']}={row['n']}"
+                    for row in st["strategy_versions"]
+                )
+                + "[/]"
             )
-            + "[/]"
+    else:
+        console.print(
+            f"[green]统计范围：当前实验 {st['strategy_version']}（固定checkpoint）[/]"
+        )
+        console.print(
+            f"决策数={st['decisions']} 交易信号={st['trade_signals']} "
+            f"已结算市场={st['resolved_markets']} 模拟订单={st['dry_orders']} "
+            f"固定checkpoint样本={st['evaluation_samples']}"
         )
 
-    t = Table(title="概率模型对比（只统计已有官方结算结果的决策快照）")
+    t = Table(title="概率模型对比（官方已结算 + 同一批样本）")
     for col in ("周期", "模型", "样本", "Brier↓", "LogLoss↓", "方向命中率"):
         t.add_column(col, justify="right" if col not in ("周期", "模型") else "left")
     for row in st["model_comparison"]:
@@ -562,14 +590,14 @@ def stats():
 
     perf = st["dry_run_performance"]
     console.print(
-        "[bold]模拟交易表现（按实际 dry-run 订单，未计手续费/滑点）：[/] "
+        "[bold]模拟交易表现（未计手续费/滑点）：[/] "
         f"已结算 {perf['trades']} 笔，赢 {perf['wins']} 笔，"
         f"命中率 {_fmt_percent(perf['hit_rate'])}，"
         f"投入 ${perf['stake_usd']:.2f}，"
         f"毛PnL {perf['pnl_usd']:+.2f}，ROI {_fmt_percent(perf['roi'])}"
     )
 
-    ts = Table(title="策略对照（每个市场首次满足条件时固定投入 $1；未计手续费/滑点）")
+    ts = Table(title="策略对照（每市场首次满足条件固定投入 $1；未计手续费/滑点）")
     for col in ("周期", "策略", "交易数", "赢", "命中率", "毛PnL", "ROI"):
         ts.add_column(col, justify="right" if col not in ("周期", "策略") else "left")
     for row in st["strategy_comparison"]:
@@ -584,7 +612,12 @@ def stats():
         )
     console.print(ts)
 
-    t2 = Table(title="交易概率分桶 vs 当时市场中间价（含历史旧决策，仅作参考）")
+    t2 = Table(
+        title=(
+            "交易概率分桶 vs 当时市场中间价"
+            + ("（全部历史）" if all_history else "（当前实验checkpoint）")
+        )
+    )
     for col in ("概率区间", "样本数", "交易概率均值", "市场均值"):
         t2.add_column(col, justify="right")
     for b in st["buckets"]:
@@ -596,6 +629,40 @@ def stats():
             f"{b['avg_mkt']:.2f}",
         )
     console.print(t2)
+
+
+@app.command("reset-experiment")
+def reset_experiment(
+    yes: bool = typer.Option(
+        False,
+        "--yes",
+        help="确认清空实验决策、checkpoint 与 dry-run 模拟订单。",
+    ),
+):
+    """清空实验统计数据；保留真实订单、价格历史、anchor 和官方结算结果。"""
+    if not yes:
+        console.print(
+            "[yellow]这是破坏性操作。确认后请执行："
+            " uv run jevymarket reset-experiment --yes[/]"
+        )
+        raise typer.Exit(1)
+
+    s = _settings()
+    store = Store(s.db_path)
+    try:
+        counts = store.clear_experiment_data()
+    finally:
+        store.close()
+
+    console.print(
+        "[green]实验数据已清空：[/] "
+        f"决策 {counts['decisions']} 条；"
+        f"checkpoint {counts['evaluation_samples']} 条；"
+        f"dry-run 模拟订单 {counts['dry_run_orders']} 条。"
+    )
+    console.print(
+        "[dim]已保留：真实订单、Chainlink 价格历史、价格 anchor、官方结算结果。[/]"
+    )
 
 
 @app.command("settle")
@@ -759,6 +826,8 @@ def _record_checkpoint_sample(
         seconds_left=snapshot.seconds_left,
         quant_p=quant_p,
         jev_p=view.p_yes,
+        jev_answerable=view.answerable,
+        jev_clarity=view.clarity,
         market_p=c.book.midpoint,
         yes_ask=c.book.yes_ask,
         no_ask=c.book.no_ask,
