@@ -6,7 +6,6 @@ import logging
 import re
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-
 from zoneinfo import ZoneInfo
 
 from polymarket import AsyncPublicClient
