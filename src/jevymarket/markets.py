@@ -5,7 +5,9 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
+
+from zoneinfo import ZoneInfo
 
 from polymarket import AsyncPublicClient
 from polymarket.models.clob.order_book import OrderBook
@@ -63,6 +65,55 @@ def market_timeframe(m: Market, s: Settings) -> str | None:
         return None
 
     return timeframe if timeframe in _allowed_timeframes(s) else None
+
+
+_EPOCH_WINDOW_RE = re.compile(r"^btc-updown-(5m|15m|1h)-(\d+)$")
+_HOURLY_SLUG_RE = re.compile(
+    r"^bitcoin-up-or-down-([a-z]+)-(\d{1,2})-(\d{4})-(\d{1,2})(am|pm)-et$"
+)
+_WINDOW_MINUTES = {"5m": 5, "15m": 15, "1h": 60}
+
+
+def market_window(m: Market, s: Settings) -> tuple[datetime, datetime] | None:
+    """从 recurring market slug 解析真实交易时间窗。"""
+    timeframe = market_timeframe(m, s)
+    if timeframe is None:
+        return None
+
+    slug = (m.slug or "").lower()
+    match = _EPOCH_WINDOW_RE.fullmatch(slug)
+    if match:
+        start = datetime.fromtimestamp(int(match.group(2)), tz=UTC)
+        return start, start + timedelta(minutes=_WINDOW_MINUTES[timeframe])
+
+    match = _HOURLY_SLUG_RE.fullmatch(slug)
+    if timeframe == "1h" and match:
+        month, day, year, hour, ampm = match.groups()
+        try:
+            naive = datetime.strptime(
+                f"{month.title()} {day} {year} {hour}{ampm.upper()}",
+                "%B %d %Y %I%p",
+            )
+        except ValueError:
+            return None
+        start = naive.replace(tzinfo=ZoneInfo("America/New_York")).astimezone(UTC)
+        return start, start + timedelta(hours=1)
+
+    return None
+
+
+def market_is_current(m: Market, s: Settings, now: datetime | None = None) -> bool:
+    """只接受此刻正在进行的短周期窗口，不接受未来预创建或刚结束市场。"""
+    window = market_window(m, s)
+    if window is None:
+        return False
+    current = now or datetime.now(UTC)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=UTC)
+    else:
+        current = current.astimezone(UTC)
+    start, end = window
+    return start <= current < end
 
 
 def market_asset_symbol(m: Market, s: Settings) -> str | None:
@@ -148,7 +199,7 @@ def book_from_orderbooks(market: Market, books: list[OrderBook] | tuple[OrderBoo
     )
 
 
-def passes_static_filters(m: Market, s: Settings) -> str | None:
+def passes_static_filters(m: Market, s: Settings, now: datetime | None = None) -> str | None:
     """Return a skip reason, or None if the market is a candidate."""
     st = m.state
     if market_asset_symbol(m, s) != "BTC":
@@ -156,6 +207,8 @@ def passes_static_filters(m: Market, s: Settings) -> str | None:
     timeframe = market_timeframe(m, s)
     if timeframe is None:
         return f"不是允许的 BTC 短周期市场 [{s.allowed_timeframes}]"
+    if not market_is_current(m, s, now=now):
+        return "不是当前正在进行的时间窗"
     if not (st.active and st.accepting_orders) or st.closed or st.archived:
         return "not tradable"
     if not st.enable_order_book:
@@ -195,6 +248,7 @@ async def fetch_book(client: AsyncPublicClient, m: Market) -> Book:
 async def scan(client: AsyncPublicClient, s: Settings, limit: int = 20, pages: int = 5) -> list[Candidate]:
     """Walk the most-traded open markets and keep those passing filters + a live book."""
     out: list[Candidate] = []
+    now = datetime.now(UTC)
     paginator = client.list_markets(
         closed=False,
         order="startDate",
@@ -205,7 +259,7 @@ async def scan(client: AsyncPublicClient, s: Settings, limit: int = 20, pages: i
     async for page in paginator:
         seen_pages += 1
         for m in page.items:
-            why = passes_static_filters(m, s)
+            why = passes_static_filters(m, s, now=now)
             if why:
                 log.debug("skip %s: %s", m.slug, why)
                 continue
