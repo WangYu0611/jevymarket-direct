@@ -17,6 +17,7 @@ from .jev import Decision, JevClient, noul, score
 from .research import Brief, Researcher, ResearchError
 
 if TYPE_CHECKING:
+    from .market_data import ShortTermSnapshot
     from .markets import Candidate
     from .store import Store
 
@@ -33,18 +34,15 @@ CLARITY_LEVELS = [
 QUESTIONS = {
     "resolves_yes": noul(
         "Estimate the probability that the FIRST listed market outcome, provided as "
-        "`primary_outcome` in state, will win. For the BTC short-term markets this is UP. "
-        "If `market_start_date` is present, treat events before that date "
-        "as background unless the resolution rules explicitly require a lookback. If an "
-        "`evidence` brief is present, weigh its dated facts and latest development against "
-        "`days_until_resolution`."
+        "`primary_outcome` in state, will win. For these BTC short-term markets this is UP. "
+        "Use `short_term_market_data` as the primary evidence: authoritative target/open "
+        "price, current reference price, price delta, percent delta, seconds remaining, and "
+        "the market's resolution rules. Do not infer probability from prediction-market odds."
     ),
     "answerable": noul(
-        "The state (including the `evidence` brief, if present) contains enough current and "
-        "relevant information to form a well-informed probability estimate for this question. "
-        "This is about information sufficiency, not certainty: an uncertain outcome can still "
-        "be well-informed. Answer NO only if key facts needed to estimate it are missing, stale, "
-        "or would require news that is not in the state."
+        "The authoritative `short_term_market_data` and resolution rules contain enough "
+        "current information to form a probability estimate. Answer NO if target/open price, "
+        "current reference price, remaining time, or the relevant source data is missing/stale."
     ),
     "clarity": score(
         "How clear and objective are the resolution criteria for this market?",
@@ -203,6 +201,22 @@ def evaluate(view: JevView, book: Book, s: Settings, bankroll_usd: float | None 
             f"信息充分度={view.answerable:.2f}，规则清晰度={view.clarity}"
         ),
     )
+
+
+async def market_data_and_ask(
+    c: Candidate,
+    s: Settings,
+    jev: JevClient,
+    snapshot: ShortTermSnapshot,
+) -> tuple[dict, JevView]:
+    """Build an odds-independent short-term state from authoritative price data."""
+    from .markets import build_state
+
+    state = build_state(c, s, brief=None)
+    state.pop("market_implied_probability_primary", None)
+    state["short_term_market_data"] = snapshot.to_state()
+    view = await ask_jev(jev, state)
+    return state, view
 
 
 async def get_brief(c: Candidate, s: Settings, store: Store, researcher: Researcher | None,
