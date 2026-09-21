@@ -4,6 +4,7 @@ from types import SimpleNamespace
 import httpx
 import respx
 
+import jevymarket.market_data as market_data
 from jevymarket.config import Settings
 from jevymarket.market_data import (
     BINANCE_KLINES_URLS,
@@ -13,7 +14,6 @@ from jevymarket.market_data import (
     fetch_binance_current,
     fetch_binance_hour_open,
     fetch_binance_recent_history,
-    _source_event_time,
     record_chainlink_anchor_event,
 )
 from jevymarket.store import Store
@@ -211,5 +211,5 @@ def test_source_event_time_prefers_payload_timestamp():
         timestamp=outer,
         payload=SimpleNamespace(timestamp=payload_ms),
     )
-    observed = _source_event_time(event)
+    observed = market_data._source_event_time(event)
     assert observed == datetime(2026, 9, 21, 5, 0, 1, tzinfo=UTC)
