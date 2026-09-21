@@ -85,3 +85,22 @@ def test_refuses_longshots_outside_band():
     # Widening the band lets it through.
     t = evaluate(_view(p_yes=0.85), _book(yes_ask=0.94, yes_bid=0.93), _settings(min_trade_price=0.01))
     assert isinstance(t, Trade) and t.outcome == "NO"
+
+
+def test_up_down_labels_are_preserved():
+    book = _book(yes_ask=0.40)
+    book = Book(
+        yes_token_id=book.yes_token_id,
+        no_token_id=book.no_token_id,
+        yes_bid=book.yes_bid,
+        yes_ask=book.yes_ask,
+        no_bid=book.no_bid,
+        no_ask=book.no_ask,
+        tick_size=book.tick_size,
+        min_order_size=book.min_order_size,
+        yes_label="Up",
+        no_label="Down",
+    )
+    t = evaluate(_view(p_yes=0.60), book, _settings())
+    assert isinstance(t, Trade)
+    assert t.outcome == "UP"
