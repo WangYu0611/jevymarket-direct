@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -54,33 +55,37 @@ def _float_or_none(value: Any) -> float | None:
 
 
 def extract_price_to_beat(payload: Any) -> float | None:
-    """Extract Polymarket's canonical opening reference price from raw Gamma event JSON."""
-    if not isinstance(payload, dict):
+    """Extract Polymarket's canonical opening reference price from exact-event Gamma JSON."""
+    price_keys = ("priceToBeat", "price_to_beat", "openPrice", "open_price")
+
+    def walk(value: Any) -> float | None:
+        if isinstance(value, dict):
+            for key in price_keys:
+                price = _float_or_none(value.get(key))
+                if price is not None:
+                    return price
+            for child in value.values():
+                found = walk(child)
+                if found is not None:
+                    return found
+            return None
+
+        if isinstance(value, list):
+            for child in value:
+                found = walk(child)
+                if found is not None:
+                    return found
+            return None
+
+        if isinstance(value, str) and value.lstrip().startswith(("{", "[")):
+            try:
+                return walk(json.loads(value))
+            except json.JSONDecodeError:
+                return None
+
         return None
 
-    containers: list[dict[str, Any]] = [payload]
-    for key in ("eventMetadata", "event_metadata", "metadata"):
-        value = payload.get(key)
-        if isinstance(value, dict):
-            containers.append(value)
-
-    markets = payload.get("markets")
-    if isinstance(markets, list):
-        for market in markets:
-            if not isinstance(market, dict):
-                continue
-            containers.append(market)
-            for key in ("eventMetadata", "event_metadata", "metadata"):
-                value = market.get(key)
-                if isinstance(value, dict):
-                    containers.append(value)
-
-    for container in containers:
-        for key in ("priceToBeat", "price_to_beat", "openPrice", "open_price"):
-            price = _float_or_none(container.get(key))
-            if price is not None:
-                return price
-    return None
+    return walk(payload)
 
 
 async def fetch_price_to_beat(
@@ -147,7 +152,7 @@ async def _first_stream_price(
                     price = _float_or_none(event.payload.value)
                     if price is not None:
                         return price
-    except (TimeoutError, asyncio.TimeoutError):
+    except TimeoutError:
         return None
     except Exception as exc:  # noqa: BLE001
         log.debug("Realtime reference-price stream failed: %s", exc)
@@ -197,12 +202,7 @@ async def fetch_short_term_snapshots(
     now: datetime | None = None,
     timeout_seconds: float = 3.0,
 ) -> dict[str, ShortTermSnapshot]:
-    captured_at = now or datetime.now(UTC)
-    if captured_at.tzinfo is None:
-        captured_at = captured_at.replace(tzinfo=UTC)
-    else:
-        captured_at = captured_at.astimezone(UTC)
-
+    requested_at = now
     timeframes = {market_timeframe(c.market, settings) for c in candidates}
     need_chainlink = bool(timeframes & {"5m", "15m"})
     need_binance = "1h" in timeframes
@@ -231,6 +231,12 @@ async def fetch_short_term_snapshots(
             ))
 
         targets = await asyncio.gather(*target_tasks) if target_tasks else []
+
+    captured_at = requested_at or datetime.now(UTC)
+    if captured_at.tzinfo is None:
+        captured_at = captured_at.replace(tzinfo=UTC)
+    else:
+        captured_at = captured_at.astimezone(UTC)
 
     for (candidate, timeframe, window), (target, target_source) in zip(
         target_meta, targets, strict=True
