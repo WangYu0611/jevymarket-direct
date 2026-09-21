@@ -300,7 +300,10 @@ def run(
             )
             if (
                 cand.condition_id in (await ex.exposure()).condition_ids
-                or store.has_order_for(cand.condition_id)
+                or store.has_order_for(
+                    cand.condition_id,
+                    include_dry_run=s.dry_run,
+                )
             ):
                 console.print(f"[dim]{cand.slug}：已有持仓或挂单，跳过[/]")
                 continue
@@ -492,7 +495,13 @@ def stats():
                 settled = await settle_pending_markets(
                     client, s, store, limit=500, grace_seconds=15.0
                 )
-            return settled, store.stats()
+            return settled, store.stats(
+                min_edge=s.min_edge,
+                min_answerable=s.min_answerable,
+                min_clarity=s.min_clarity,
+                min_trade_price=s.min_trade_price,
+                max_trade_price=s.max_trade_price,
+            )
         finally:
             store.close()
 
@@ -527,6 +536,20 @@ def stats():
         f"投入 ${perf['stake_usd']:.2f}，"
         f"毛PnL {perf['pnl_usd']:+.2f}，ROI {_fmt_percent(perf['roi'])}"
     )
+
+    ts = Table(title="策略对照（每个市场首次满足条件时固定投入 $1；未计手续费/滑点）")
+    for col in ("策略", "交易数", "赢", "命中率", "毛PnL", "ROI"):
+        ts.add_column(col, justify="right" if col != "策略" else "left")
+    for row in st["strategy_comparison"]:
+        ts.add_row(
+            row["strategy"],
+            str(row["trades"]),
+            str(row["wins"]),
+            _fmt_percent(row["hit_rate"]),
+            f"${row['pnl_usd']:+.2f}",
+            _fmt_percent(row["roi"]),
+        )
+    console.print(ts)
 
     t2 = Table(title="交易概率分桶 vs 当时市场中间价")
     for col in ("概率区间", "样本数", "量化均值", "市场均值"):
