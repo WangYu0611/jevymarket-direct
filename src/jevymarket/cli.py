@@ -13,6 +13,7 @@ from rich.table import Table
 from . import __version__
 from .config import Settings, load_settings
 from .jev import JevClient, JevError, choice, noul, score
+from .market_data import ShortTermSnapshot, fetch_short_term_snapshots
 from .markets import TIMEFRAME_LABELS, Candidate, load_candidate, market_timeframe, scan
 from .research import Brief, Researcher, ResearchError
 from .signal import Trade, evaluate, get_brief, research_and_ask
@@ -110,19 +111,41 @@ def scan_cmd(limit: int = typer.Option(15, "--limit", "-n"), pages: int = typer.
 
     async def go():
         async with AsyncPublicClient() as c:
-            return await scan(c, s, limit=limit, pages=pages)
+            candidates = await scan(c, s, limit=limit, pages=pages)
+            snapshots = await fetch_short_term_snapshots(c, candidates, s)
+            return candidates, snapshots
 
-    cands = _run(go())
+    cands, snapshots = _run(go())
     t = Table(title=f"候选市场：{len(cands)} 个（仅 BTC 5分钟 / 15分钟 / 1小时）")
-    for col in ("市场 slug", "周期", "上涨买价", "上涨卖价", "下跌卖价", "流动性 $", "成交量 $"):
-        t.add_column(col, justify="right" if col not in ("市场 slug", "周期") else "left")
+    columns = (
+        "市场 slug", "周期", "目标价", "当前价", "差值", "剩余",
+        "买入上涨", "卖出上涨", "买入下跌", "卖出下跌",
+    )
+    for col in columns:
+        t.add_column(col, justify="left" if col in ("市场 slug", "周期") else "right")
     for cand in cands:
-        m = cand.market
-        tf = market_timeframe(m, s) or "?"
-        t.add_row(cand.slug[:72], TIMEFRAME_LABELS.get(tf, tf), _fmt(cand.book.yes_bid),
-                  _fmt(cand.book.yes_ask), _fmt(cand.book.no_ask),
-                  f"{float(m.metrics.liquidity_num or 0):,.0f}", f"{float(m.metrics.volume_num or 0):,.0f}")
+        tf = market_timeframe(cand.market, s) or "?"
+        snap = snapshots.get(cand.slug)
+        t.add_row(
+            cand.slug[:72],
+            TIMEFRAME_LABELS.get(tf, tf),
+            _fmt_usd(snap.target_price if snap else None),
+            _fmt_usd(snap.current_price if snap else None),
+            _fmt_delta(snap.delta_usd if snap else None),
+            _fmt_seconds(snap.seconds_left if snap else None),
+            _fmt_cents(cand.book.yes_ask),
+            _fmt_cents(cand.book.yes_bid),
+            _fmt_cents(cand.book.no_ask),
+            _fmt_cents(cand.book.no_bid),
+        )
     console.print(t)
+    for cand in cands:
+        snap = snapshots.get(cand.slug)
+        if snap and (snap.target_source or snap.current_source):
+            console.print(
+                f"[dim]{cand.slug}：目标价源={snap.target_source or '未知'}；"
+                f"当前价源={snap.current_source or '未知'}[/]"
+            )
 
 
 
@@ -330,6 +353,32 @@ def _fmt(x: float | None) -> str:
     return "-" if x is None else f"{x:.3f}"
 
 
+def _fmt_cents(x: float | None) -> str:
+    if x is None:
+        return "—"
+    cents = x * 100
+    return f"{cents:.1f}¢" if abs(cents - round(cents)) > 1e-9 else f"{cents:.0f}¢"
+
+
+def _fmt_usd(x: float | None) -> str:
+    return "—" if x is None else f"${x:,.2f}"
+
+
+def _fmt_delta(x: float | None) -> str:
+    if x is None:
+        return "—"
+    return f"{x:+,.2f}"
+
+
+def _fmt_seconds(seconds: int | None) -> str:
+    if seconds is None:
+        return "—"
+    minutes, secs = divmod(max(0, seconds), 60)
+    if minutes:
+        return f"{minutes}分{secs:02d}秒"
+    return f"{secs}秒"
+
+
 def _print_brief(b: Brief, cached: bool, full: bool = False) -> None:
     tag = "缓存" if cached else "官方 API"
     console.print(f"  [cyan]研究证据[/] 截至 {b.as_of or '?'}（{b.model or '研究模型'}，{tag}）：{b.summary}")
@@ -368,8 +417,8 @@ def _print_decision(c: Candidate, v, result, brief: Brief | None = None, cached:
         f"[bold]{c.slug}[/]\n"
         f"  市场：BTC {TIMEFRAME_LABELS.get(tf, tf)}涨跌\n"
         f"  原始问题：{c.question}\n"
-        f"  盘口：{primary} 买价/卖价 {_fmt(c.book.yes_bid)}/{_fmt(c.book.yes_ask)}；"
-        f"{secondary} 卖价 {_fmt(c.book.no_ask)}\n"
+        f"  盘口：买入{primary} {_fmt_cents(c.book.yes_ask)}；卖出{primary} {_fmt_cents(c.book.yes_bid)}；"
+        f"买入{secondary} {_fmt_cents(c.book.no_ask)}；卖出{secondary} {_fmt_cents(c.book.no_bid)}\n"
         f"  Jev：P({primary})={v.p_yes:.2f}  信息充分度={v.answerable:.2f}  "
         f"规则清晰度={v.clarity_mean}（置信度 {v.clarity_confidence}）"
     )
