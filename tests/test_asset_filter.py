@@ -2,7 +2,13 @@ from datetime import UTC, datetime
 from types import SimpleNamespace
 
 from jevymarket.config import Settings
-from jevymarket.markets import market_asset_symbol, market_is_current, market_timeframe, market_window
+from jevymarket.markets import (
+    current_market_slugs,
+    market_asset_symbol,
+    market_is_current,
+    market_timeframe,
+    market_window,
+)
 
 
 def _settings(assets: str = "BTC", timeframes: str = "5m,15m,1h") -> Settings:
@@ -85,3 +91,14 @@ def test_hourly_et_slug_window():
     start, end = market_window(m, s)
     assert start == datetime(2026, 9, 21, 5, 0, tzinfo=UTC)
     assert end == datetime(2026, 9, 21, 6, 0, tzinfo=UTC)
+
+
+def test_current_market_slugs_are_exact_windows():
+    s = _settings()
+    now = datetime(2026, 9, 21, 4, 42, 30, tzinfo=UTC)
+    slugs = current_market_slugs(s, now)
+    assert slugs == [
+        "btc-updown-5m-1789965600",
+        "btc-updown-15m-1789965000",
+        "bitcoin-up-or-down-september-21-2026-12am-et",
+    ]
