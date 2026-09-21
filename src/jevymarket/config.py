@@ -10,31 +10,31 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
     # --- keys -------------------------------------------------------------
-    openrouter_api_key: str = ""
+    typesafe_api_key: str = ""
+    deepseek_api_key: str = ""
     polymarket_private_key: str = ""
     # Optional: the Polymarket proxy / deposit wallet address if you trade via the
     # website's wallet rather than the raw EOA. Leave empty to let the SDK resolve it.
     polymarket_wallet: str | None = None
 
-    # --- Jev --------------------------------------------------------------
-    jev_model: str = "typesafe/jev-1.13"
-    openrouter_base_url: str = "https://openrouter.ai/api"
+    # --- Jev (TypeSafe official API) --------------------------------------
+    jev_model: str = "jev-latest"
+    typesafe_base_url: str = "https://api.typesafe.ai/v1"
 
-    # --- researcher (generative model + web search via OpenRouter) ---------------
+    # --- researcher (DeepSeek official API + native web search) -----------
     research_enabled: bool = True
-    research_model: str = "deepseek/deepseek-v4-pro-0813"
-    research_ttl_hours: float = 6.0        # reuse a cached brief for this long
-    max_research_per_run: int = 20         # hard cap on researcher calls per `run` pass
-    research_max_results: int = 5          # web search results per brief
-    research_max_chars: int = 2500         # evidence block size in the Jev state
-    research_exclude_domains: list[str] | None = None  # None -> research.DEFAULT_EXCLUDE_DOMAINS
+    research_model: str = "deepseek-v4-pro"
+    deepseek_base_url: str = "https://api.deepseek.com/anthropic/v1"
+    research_ttl_hours: float = 6.0
+    max_research_per_run: int = 20
+    research_max_searches: int = 5
+    research_max_chars: int = 2500
+    research_exclude_domains: list[str] | None = None
 
     # --- signal thresholds -------------------------------------------------
-    min_edge: float = 0.08          # |P_jev - best ask| required to trade
-    min_answerable: float = 0.70    # Jev's belief that the question is judgeable from the state
-    min_clarity: int = 2            # 0..4 score of how unambiguous the resolution criteria are
-    # Only buy contracts priced inside this band. LLMs tend to be under-confident at the extremes,
-    # so "edge" on 5-cent longshots is usually the model, not the market, being wrong.
+    min_edge: float = 0.08
+    min_answerable: float = 0.70
+    min_clarity: int = 2
     min_trade_price: float = 0.10
     max_trade_price: float = 0.90
 
@@ -43,7 +43,6 @@ class Settings(BaseSettings):
     min_volume_usd: float = 10_000
     max_days_to_resolution: int = 60
     max_spread: float = 0.06
-    # Skip markets already priced at the extremes: no room for edge, wasted Jev calls.
     min_market_price: float = 0.03
     max_market_price: float = 0.97
     description_max_chars: int = 1_500
