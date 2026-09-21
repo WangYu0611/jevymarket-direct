@@ -20,7 +20,7 @@ from .research import Brief, Researcher, ResearchError
 from .signal import Trade, evaluate, get_brief, market_data_and_ask
 from .store import Store
 
-app = typer.Typer(help="Polymarket BTC 短周期交易机器人：TypeSafe Jev + DeepSeek 官方 API。", no_args_is_help=True)
+app = typer.Typer(help="Polymarket BTC 短周期交易机器人：Chainlink/Binance 实时数据 + TypeSafe Jev。", no_args_is_help=True)
 console = Console()
 log = logging.getLogger("jevymarket")
 
@@ -147,9 +147,17 @@ def scan_cmd(limit: int = typer.Option(15, "--limit", "-n"), pages: int = typer.
     for cand in cands:
         snap = snapshots.get(cand.slug)
         if snap and (snap.target_source or snap.current_source):
+            pf = snap.path_features
+            path_text = "无"
+            if pf is not None:
+                path_text = (
+                    f"{'完整' if pf.feature_ready else '预热'} "
+                    f"{pf.history_span_seconds}s；1m={_fmt_pct(pf.return_60s_pct)}；"
+                    f"3m={_fmt_pct(pf.return_180s_pct)}；Z={_fmt_num(pf.distance_z)}"
+                )
             console.print(
                 f"[dim]{cand.slug}：目标价源={snap.target_source or '未知'}；"
-                f"当前价源={snap.current_source or '未知'}[/]"
+                f"当前价源={snap.current_source or '未知'}；路径={path_text}[/]"
             )
 
 
@@ -198,11 +206,7 @@ def decide(ref: str = typer.Argument(..., help="市场 slug 或 polymarket.com U
                 snapshot = snapshots.get(cand.slug)
                 _print_snapshot(snapshot)
                 if snapshot is None or not snapshot.trade_ready:
-                    console.print(
-                        "[yellow]跳过：权威参考数据不完整。"
-                        "5分钟/15分钟必须等本机在窗口起点捕获 Chainlink TWAP；"
-                        "不会用网页或其他交易所补值。[/]"
-                    )
+                    console.print(f"[yellow]跳过：{_snapshot_not_ready_reason(snapshot)}[/]")
                     return
                 state, view = await market_data_and_ask(cand, s, jev, snapshot)
                 if show_state:
@@ -258,8 +262,7 @@ def run(
             _print_snapshot(snapshot)
             if snapshot is None or not snapshot.trade_ready:
                 console.print(
-                    "  [yellow]跳过：权威参考数据不完整；"
-                    "等待下一个窗口由 Chainlink 起始价监听器捕获目标价。[/]"
+                    f"  [yellow]跳过：{_snapshot_not_ready_reason(snapshot)}[/]"
                 )
                 continue
 
@@ -322,14 +325,14 @@ def run(
 
 @app.command("watch-prices")
 def watch_prices():
-    """持续监听 Chainlink，并在 5分钟/15分钟窗口起点保存权威目标价。"""
+    """持续记录 Chainlink 原始价格路径，并捕获 5分钟/15分钟窗口起始 TWAP。"""
     s = _settings()
 
     async def go():
         store = Store(s.db_path)
         console.print(
-            "[cyan]开始监听 Chainlink BTC/USD TWAP 30s/60s。"
-            "请保持运行；捕获到新窗口起始价时会自动写入 SQLite。[/]"
+            "[cyan]开始监听 Chainlink BTC/USD 原始价 + TWAP 30s/60s。"
+            "程序会持续保存短期价格路径，并在新窗口起点写入权威目标价。[/]"
         )
         try:
             await watch_chainlink_anchors(s, store)
@@ -445,6 +448,38 @@ def _fmt_seconds(seconds: int | None) -> str:
     return f"{secs}秒"
 
 
+def _fmt_pct(value: float | None) -> str:
+    return "—" if value is None else f"{value:+.3f}%"
+
+
+def _fmt_num(value: float | None, digits: int = 2) -> str:
+    return "—" if value is None else f"{value:+.{digits}f}"
+
+
+def _snapshot_not_ready_reason(snapshot: ShortTermSnapshot | None) -> str:
+    if snapshot is None:
+        return "没有获取到参考数据"
+    missing = []
+    if snapshot.target_price is None:
+        missing.append("目标价")
+    if snapshot.current_price is None:
+        missing.append("当前价")
+    if snapshot.seconds_left is None or snapshot.seconds_left <= 0:
+        missing.append("有效剩余时间")
+    if missing:
+        return "权威参考数据缺失：" + "、".join(missing)
+    pf = snapshot.path_features
+    if pf is None:
+        return "价格路径尚未建立"
+    if not pf.feature_ready:
+        age = "未知" if pf.latest_sample_age_seconds is None else f"{pf.latest_sample_age_seconds:.1f}s"
+        return (
+            f"价格路径仍在预热：历史 {pf.history_span_seconds}s，"
+            f"最新样本年龄 {age}；等待更多实时样本"
+        )
+    return "参考数据尚未达到交易条件"
+
+
 def _print_brief(b: Brief, cached: bool, full: bool = False) -> None:
     tag = "缓存" if cached else "官方 API"
     console.print(f"  [cyan]研究证据[/] 截至 {b.as_of or '?'}（{b.model or '研究模型'}，{tag}）：{b.summary}")
@@ -483,9 +518,31 @@ def _print_snapshot(snapshot: ShortTermSnapshot | None) -> None:
     console.print(
         f"  参考数据：目标价 {_fmt_usd(snapshot.target_price)}；"
         f"当前价 {_fmt_usd(snapshot.current_price)}；"
-        f"差值 {_fmt_delta(snapshot.delta_usd)}；"
+        f"差值 {_fmt_delta(snapshot.delta_usd)}（{_fmt_pct(snapshot.delta_pct)}）；"
         f"剩余 {_fmt_seconds(snapshot.seconds_left)}；状态 {readiness}"
     )
+    pf = snapshot.path_features
+    if pf is not None:
+        console.print(
+            "  价格路径："
+            f"30秒 {_fmt_pct(pf.return_30s_pct)}；"
+            f"1分钟 {_fmt_pct(pf.return_60s_pct)}；"
+            f"3分钟 {_fmt_pct(pf.return_180s_pct)}；"
+            f"5分钟 {_fmt_pct(pf.return_300s_pct)}"
+        )
+        console.print(
+            "  波动/趋势："
+            f"1分钟RV {_fmt_pct(pf.realized_vol_60s_pct)}；"
+            f"3分钟RV {_fmt_pct(pf.realized_vol_180s_pct)}；"
+            f"1分钟趋势 {_fmt_pct(pf.trend_60s_pct_per_min)}/分钟；"
+            f"上涨tick {_fmt_num(None if pf.up_tick_ratio_60s is None else pf.up_tick_ratio_60s * 100, 1)}%；"
+            f"剩余波动 {_fmt_pct(pf.remaining_vol_pct)}；Z {_fmt_num(pf.distance_z)}"
+        )
+        console.print(
+            f"  [dim]路径源={pf.history_source}；样本={pf.sample_count}；"
+            f"跨度={pf.history_span_seconds}s；"
+            f"最新样本年龄={('—' if pf.latest_sample_age_seconds is None else f'{pf.latest_sample_age_seconds:.1f}s')}[/]"
+        )
     console.print(
         f"  [dim]目标价源={snapshot.target_source or '缺失'}；"
         f"当前价源={snapshot.current_source or '缺失'}[/]"
