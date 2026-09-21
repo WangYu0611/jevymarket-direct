@@ -96,6 +96,7 @@ async def test_transport_timeout_exhaustion_becomes_jev_error():
     assert ei.value.status == 0
     assert "ReadTimeout" in str(ei.value)
 
+
 @respx.mock
 async def test_ssl_error_retries_then_succeeds(monkeypatch):
     calls = 0
