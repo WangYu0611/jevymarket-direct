@@ -156,14 +156,46 @@ class JevClient:
         body = {"model": self.model, "state": state, "questions": questions}
         delay = 0.5
         for attempt in range(1, self.max_retries + 1):
-            resp = await self._client.post(self._url, json=body, headers=self._headers)
+            try:
+                resp = await self._client.post(
+                    self._url,
+                    json=body,
+                    headers=self._headers,
+                )
+            except httpx.TransportError as exc:
+                msg = f"{type(exc).__name__}: {exc or 'network transport error'}"
+                if attempt < self.max_retries:
+                    sleep = delay * (1 + random.random())
+                    log.warning(
+                        "Jev 网络错误（%s）；重试 %d/%d，%.1fs 后继续",
+                        msg,
+                        attempt,
+                        self.max_retries,
+                        sleep,
+                    )
+                    await asyncio.sleep(sleep)
+                    delay *= 2
+                    continue
+                raise JevError(
+                    0,
+                    f"网络请求失败，已重试 {self.max_retries} 次：{msg}",
+                    {"exception": type(exc).__name__},
+                ) from exc
+
             if resp.status_code < 400:
                 return resp.json()
             retryable = resp.status_code == 429 or resp.status_code >= 500
             msg = _error_message(resp)
             if retryable and attempt < self.max_retries:
                 sleep = delay * (1 + random.random())
-                log.warning("Jev %s (%s); retry %d/%d in %.1fs", resp.status_code, msg, attempt, self.max_retries, sleep)
+                log.warning(
+                    "Jev %s (%s)；重试 %d/%d，%.1fs 后继续",
+                    resp.status_code,
+                    msg,
+                    attempt,
+                    self.max_retries,
+                    sleep,
+                )
                 await asyncio.sleep(sleep)
                 delay *= 2
                 continue
