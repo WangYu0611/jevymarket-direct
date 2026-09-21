@@ -96,57 +96,37 @@ _NEXT_DATA_RE = re.compile(
 )
 
 
-def _subtree_contains(value: Any, needles: tuple[str, ...]) -> bool:
-    try:
-        text = json.dumps(value, ensure_ascii=False).lower()
-    except (TypeError, ValueError):
-        return False
-    return all(needle.lower() in text for needle in needles)
-
-
 def extract_live_open_price(next_data: Any, slug: str, window_start: datetime | None) -> float | None:
-    """Find the exact active-window crypto-prices openPrice in Polymarket __NEXT_DATA__."""
-    candidates: list[tuple[int, float]] = []
+    """Find the exact React Query crypto-prices openPrice for this active window."""
+    candidates: list[tuple[int, int, float]] = []
     start_epoch = str(int(window_start.timestamp())) if window_start is not None else ""
-    start_iso = window_start.astimezone(UTC).isoformat().replace("+00:00", "Z") if window_start else ""
+    start_iso = (
+        window_start.astimezone(UTC).isoformat().replace("+00:00", "Z")
+        if window_start else ""
+    )
     slug_l = slug.lower()
 
     def walk(value: Any) -> None:
         if isinstance(value, dict):
-            # Score every dict containing an openPrice somewhere below it. This lets us
-            # bind state.data.openPrice to the surrounding React Query queryKey/context.
-            open_price = None
-            if "openPrice" in value:
-                open_price = _float_or_none(value.get("openPrice"))
-            elif "open_price" in value:
-                open_price = _float_or_none(value.get("open_price"))
-
-            if open_price is not None:
-                score = 0
-                if _subtree_contains(value, ("crypto-prices",)):
-                    score += 4
-                text = json.dumps(value, ensure_ascii=False).lower()
-                if slug_l and slug_l in text:
-                    score += 8
-                if start_epoch and start_epoch in text:
-                    score += 6
-                if start_iso and start_iso.lower() in text:
-                    score += 6
-                candidates.append((score, open_price))
-
-            # A parent object may contain queryKey/context while openPrice lives deeper.
-            if "crypto-prices" in json.dumps(value, ensure_ascii=False).lower():
-                nested = extract_price_to_beat(value)
-                if nested is not None:
-                    score = 4
-                    text = json.dumps(value, ensure_ascii=False).lower()
-                    if slug_l and slug_l in text:
-                        score += 8
-                    if start_epoch and start_epoch in text:
-                        score += 6
-                    if start_iso and start_iso.lower() in text:
-                        score += 6
-                    candidates.append((score, nested))
+            query_key = value.get("queryKey")
+            if query_key is not None:
+                key_text = json.dumps(query_key, ensure_ascii=False).lower()
+                if "crypto-prices" in key_text:
+                    state = value.get("state")
+                    data = state.get("data") if isinstance(state, dict) else None
+                    open_price = extract_price_to_beat(data)
+                    if open_price is not None:
+                        score = 4
+                        context_text = json.dumps(value, ensure_ascii=False).lower()
+                        if slug_l and slug_l in context_text:
+                            score += 8
+                        if start_epoch and start_epoch in context_text:
+                            score += 6
+                        if start_iso and start_iso.lower() in context_text:
+                            score += 6
+                        # Prefer the smallest matching query object when scores tie,
+                        # avoiding a broad parent that contains neighboring windows.
+                        candidates.append((score, -len(context_text), open_price))
 
             for child in value.values():
                 walk(child)
@@ -157,8 +137,8 @@ def extract_live_open_price(next_data: Any, slug: str, window_start: datetime | 
     walk(next_data)
     if not candidates:
         return None
-    candidates.sort(key=lambda item: item[0], reverse=True)
-    best_score, best_price = candidates[0]
+    candidates.sort(reverse=True)
+    best_score, _, best_price = candidates[0]
     return best_price if best_score >= 4 else None
 
 
