@@ -20,7 +20,7 @@ from polymarket import AsyncPublicClient
 from rich.console import Console
 from rich.table import Table
 
-from .fast_runner import FastRunner, JevShadow, settlement_worker, settle_some
+from .fast_runner import FastRunner, JevShadow, settle_some, settlement_worker
 from .fast_store import FastStore, dump, probability_metrics
 from .fast_strategy import CHECKPOINTS, experiment_parameters, next_deadline
 from .jev import JevClient
