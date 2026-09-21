@@ -1,19 +1,22 @@
-"""Authoritative short-term BTC reference data.
+"""Authoritative short-term BTC reference data and path features.
 
 5m/15m:
-- Current price: Polymarket RTDS Chainlink BTC/USD TWAP stream.
-- Target price: first trusted Chainlink TWAP captured at the window boundary and
-  persisted locally. If that anchor is missing, the window is not trade-ready.
+- Resolution anchor/current: Polymarket RTDS Chainlink BTC/USD TWAP stream.
+- Path history: Polymarket RTDS raw Chainlink BTC/USD stream.
+- The window anchor is captured locally at the boundary and persisted.
 
 1h:
-- Target: Binance BTC/USDT 1H open.
-- Current: Binance BTC/USDT realtime stream.
+- Resolution anchor/current/history: direct Binance BTC/USDT REST API.
+
+Prediction-market odds are deliberately excluded from these features.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import math
+import statistics
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -32,13 +35,64 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 
-GAMMA_EVENTS_URL = "https://gamma-api.polymarket.com/events"
 BINANCE_KLINES_URLS = (
     "https://api.binance.com/api/v3/klines",
     "https://api.binance.us/api/v3/klines",
 )
+BINANCE_TICKER_URLS = (
+    "https://api.binance.com/api/v3/ticker/price",
+    "https://api.binance.us/api/v3/ticker/price",
+)
 
 _WINDOW_SECONDS = {"5m": 300, "15m": 900}
+
+
+@dataclass(frozen=True)
+class PricePathFeatures:
+    history_source: str
+    sample_count: int
+    history_span_seconds: int
+    latest_sample_age_seconds: float | None
+    return_30s_pct: float | None
+    return_60s_pct: float | None
+    return_180s_pct: float | None
+    return_300s_pct: float | None
+    realized_vol_60s_pct: float | None
+    realized_vol_180s_pct: float | None
+    realized_vol_300s_pct: float | None
+    range_60s_pct: float | None
+    range_180s_pct: float | None
+    range_300s_pct: float | None
+    up_tick_ratio_60s: float | None
+    trend_60s_pct_per_min: float | None
+    trend_180s_pct_per_min: float | None
+    remaining_vol_pct: float | None
+    distance_z: float | None
+    feature_ready: bool
+
+    def to_state(self) -> dict[str, Any]:
+        return {
+            "history_source": self.history_source,
+            "sample_count": self.sample_count,
+            "history_span_seconds": self.history_span_seconds,
+            "latest_sample_age_seconds": self.latest_sample_age_seconds,
+            "return_30s_pct": self.return_30s_pct,
+            "return_60s_pct": self.return_60s_pct,
+            "return_180s_pct": self.return_180s_pct,
+            "return_300s_pct": self.return_300s_pct,
+            "realized_vol_60s_pct": self.realized_vol_60s_pct,
+            "realized_vol_180s_pct": self.realized_vol_180s_pct,
+            "realized_vol_300s_pct": self.realized_vol_300s_pct,
+            "range_60s_pct": self.range_60s_pct,
+            "range_180s_pct": self.range_180s_pct,
+            "range_300s_pct": self.range_300s_pct,
+            "up_tick_ratio_60s": self.up_tick_ratio_60s,
+            "trend_60s_pct_per_min": self.trend_60s_pct_per_min,
+            "trend_180s_pct_per_min": self.trend_180s_pct_per_min,
+            "remaining_vol_pct": self.remaining_vol_pct,
+            "distance_z": self.distance_z,
+            "feature_ready": self.feature_ready,
+        }
 
 
 @dataclass(frozen=True)
@@ -50,6 +104,7 @@ class ShortTermSnapshot:
     current_source: str | None
     captured_at: datetime
     twap_window_seconds: int | None = None
+    path_features: PricePathFeatures | None = None
 
     @property
     def delta_usd(self) -> float | None:
@@ -64,12 +119,18 @@ class ShortTermSnapshot:
         return (self.current_price / self.target_price - 1.0) * 100.0
 
     @property
+    def distance_bps(self) -> float | None:
+        return None if self.delta_pct is None else self.delta_pct * 100.0
+
+    @property
     def trade_ready(self) -> bool:
         return (
             self.target_price is not None
             and self.current_price is not None
             and self.seconds_left is not None
             and self.seconds_left > 0
+            and self.path_features is not None
+            and self.path_features.feature_ready
         )
 
     def to_state(self) -> dict[str, Any]:
@@ -78,10 +139,12 @@ class ShortTermSnapshot:
             "current_price": self.current_price,
             "delta_usd": self.delta_usd,
             "delta_pct": self.delta_pct,
+            "distance_bps": self.distance_bps,
             "seconds_left": self.seconds_left,
             "target_source": self.target_source,
             "current_source": self.current_source,
             "twap_window_seconds": self.twap_window_seconds,
+            "path_features": self.path_features.to_state() if self.path_features else None,
             "trade_ready": self.trade_ready,
         }
 
@@ -96,30 +159,6 @@ def _float_or_none(value: Any) -> float | None:
     return number if number > 0 else None
 
 
-def extract_price_to_beat(payload: Any) -> float | None:
-    """Extract a canonical priceToBeat/openPrice value from Gamma JSON."""
-    price_keys = ("priceToBeat", "price_to_beat", "openPrice", "open_price")
-
-    def walk(value: Any) -> float | None:
-        if isinstance(value, dict):
-            for key in price_keys:
-                price = _float_or_none(value.get(key))
-                if price is not None:
-                    return price
-            for child in value.values():
-                found = walk(child)
-                if found is not None:
-                    return found
-        elif isinstance(value, list):
-            for child in value:
-                found = walk(child)
-                if found is not None:
-                    return found
-        return None
-
-    return walk(payload)
-
-
 def chainlink_twap_window_seconds(candidate: Candidate) -> int:
     """Read the market's own resolution wording/source instead of assuming 60s."""
     market = candidate.market
@@ -132,54 +171,78 @@ def chainlink_twap_window_seconds(candidate: Candidate) -> int:
     return 60
 
 
-async def fetch_binance_hour_open(http: httpx.AsyncClient, start: datetime) -> float | None:
-    start_ms = int(start.astimezone(UTC).timestamp() * 1000)
-    params = {
-        "symbol": "BTCUSDT",
-        "interval": "1h",
-        "startTime": start_ms,
-        "limit": 1,
-    }
-    for url in BINANCE_KLINES_URLS:
+async def _binance_get_json(
+    http: httpx.AsyncClient,
+    urls: tuple[str, ...],
+    *,
+    params: dict[str, Any],
+) -> Any:
+    last_error: Exception | None = None
+    for url in urls:
         try:
             response = await http.get(url, params=params)
             response.raise_for_status()
-            data = response.json()
-            if isinstance(data, list) and data and isinstance(data[0], list) and len(data[0]) > 1:
-                price = _float_or_none(data[0][1])
-                if price is not None:
-                    return price
+            return response.json()
         except Exception as exc:  # noqa: BLE001
-            log.debug("Binance 1H open unavailable from %s: %s", url, exc)
+            last_error = exc
+            log.debug("Binance request failed from %s: %s", url, exc)
+    if last_error is not None:
+        log.debug("All Binance endpoints failed: %s", last_error)
     return None
 
 
-async def fetch_hour_target(
-    http: httpx.AsyncClient,
-    slug: str,
-    window_start: datetime,
-) -> tuple[float | None, str | None]:
-    """Prefer Gamma's canonical anchor, then fall back to the Binance 1H open."""
-    try:
-        response = await http.get(GAMMA_EVENTS_URL, params={"slug": slug})
-        response.raise_for_status()
-        raw = response.json()
-        event = raw[0] if isinstance(raw, list) and raw else raw
-        price = extract_price_to_beat(event)
-        if price is not None:
-            return price, "Polymarket priceToBeat"
-    except Exception as exc:  # noqa: BLE001
-        log.debug("Gamma priceToBeat unavailable for %s: %s", slug, exc)
+async def fetch_binance_hour_open(http: httpx.AsyncClient, start: datetime) -> float | None:
+    data = await _binance_get_json(
+        http,
+        BINANCE_KLINES_URLS,
+        params={
+            "symbol": "BTCUSDT",
+            "interval": "1h",
+            "startTime": int(start.astimezone(UTC).timestamp() * 1000),
+            "limit": 1,
+        },
+    )
+    if isinstance(data, list) and data and isinstance(data[0], list) and len(data[0]) > 1:
+        return _float_or_none(data[0][1])
+    return None
 
-    price = await fetch_binance_hour_open(http, window_start)
-    if price is not None:
-        return price, "Binance 1H open"
-    return None, None
+
+async def fetch_binance_current(http: httpx.AsyncClient) -> float | None:
+    data = await _binance_get_json(
+        http,
+        BINANCE_TICKER_URLS,
+        params={"symbol": "BTCUSDT"},
+    )
+    return _float_or_none(data.get("price")) if isinstance(data, dict) else None
+
+
+async def fetch_binance_recent_history(
+    http: httpx.AsyncClient,
+    *,
+    limit: int = 8,
+) -> list[dict[str, float]]:
+    """Return recent 1m BTCUSDT closes from direct Binance REST."""
+    data = await _binance_get_json(
+        http,
+        BINANCE_KLINES_URLS,
+        params={"symbol": "BTCUSDT", "interval": "1m", "limit": limit},
+    )
+    out: list[dict[str, float]] = []
+    if not isinstance(data, list):
+        return out
+    for row in data:
+        if not isinstance(row, list) or len(row) < 5:
+            continue
+        price = _float_or_none(row[4])
+        if price is None:
+            continue
+        out.append({"ts": float(row[0]) / 1000.0, "price": price})
+    return out
 
 
 async def _first_stream_price(
     client: AsyncPublicClient,
-    spec: CryptoPricesChainlinkTwapSpec | CryptoPricesSpec,
+    spec: CryptoPricesChainlinkTwapSpec,
     timeout_seconds: float,
 ) -> float | None:
     try:
@@ -192,22 +255,20 @@ async def _first_stream_price(
     except TimeoutError:
         return None
     except Exception as exc:  # noqa: BLE001
-        log.debug("Realtime reference-price stream failed: %s", exc)
+        log.debug("Chainlink TWAP stream failed: %s", exc)
         return None
     return None
 
 
-async def fetch_reference_prices(
+async def fetch_chainlink_twap_prices(
     client: AsyncPublicClient,
     *,
-    chainlink_windows: set[int],
-    need_binance: bool,
+    windows: set[int],
     timeout_seconds: float = 3.0,
-) -> tuple[dict[int, float | None], float | None]:
+) -> dict[int, float | None]:
     tasks: list[asyncio.Task[float | None]] = []
-    labels: list[str] = []
-
-    for window_seconds in sorted(chainlink_windows):
+    labels: list[int] = []
+    for window_seconds in sorted(windows):
         tasks.append(asyncio.create_task(_first_stream_price(
             client,
             CryptoPricesChainlinkTwapSpec(
@@ -216,26 +277,200 @@ async def fetch_reference_prices(
             ),
             timeout_seconds,
         )))
-        labels.append(f"chainlink-{window_seconds}")
-
-    if need_binance:
-        tasks.append(asyncio.create_task(_first_stream_price(
-            client,
-            CryptoPricesSpec(topic="prices.crypto.binance", symbols=["btcusdt"]),
-            timeout_seconds,
-        )))
-        labels.append("binance")
-
+        labels.append(window_seconds)
     if not tasks:
-        return {}, None
-
+        return {}
     values = await asyncio.gather(*tasks)
-    by_label = dict(zip(labels, values, strict=True))
-    chainlink = {
-        window: by_label.get(f"chainlink-{window}")
-        for window in chainlink_windows
-    }
-    return chainlink, by_label.get("binance")
+    return dict(zip(labels, values, strict=True))
+
+
+def _normalize_samples(samples: list[dict[str, Any]]) -> list[tuple[float, float]]:
+    by_ts: dict[int, float] = {}
+    for sample in samples:
+        ts = sample.get("ts")
+        price = _float_or_none(sample.get("price"))
+        if ts is None or price is None:
+            continue
+        by_ts[int(float(ts))] = price
+    return [(float(ts), by_ts[ts]) for ts in sorted(by_ts)]
+
+
+def _nearest_price(
+    points: list[tuple[float, float]],
+    target_ts: float,
+    *,
+    tolerance_seconds: float,
+) -> float | None:
+    if not points:
+        return None
+    ts, price = min(points, key=lambda item: abs(item[0] - target_ts))
+    return price if abs(ts - target_ts) <= tolerance_seconds else None
+
+
+def _window_points(
+    points: list[tuple[float, float]],
+    end_ts: float,
+    window_seconds: int,
+) -> list[tuple[float, float]]:
+    cutoff = end_ts - window_seconds
+    return [(ts, price) for ts, price in points if cutoff <= ts <= end_ts]
+
+
+def _return_pct(
+    points: list[tuple[float, float]],
+    end_ts: float,
+    window_seconds: int,
+) -> float | None:
+    if not points:
+        return None
+    start_price = _nearest_price(
+        points,
+        end_ts - window_seconds,
+        tolerance_seconds=5.0 if window_seconds <= 300 else 10.0,
+    )
+    end_price = points[-1][1]
+    if start_price is None or start_price <= 0:
+        return None
+    return (end_price / start_price - 1.0) * 100.0
+
+
+def _realized_vol_pct(window: list[tuple[float, float]]) -> float | None:
+    if len(window) < 4:
+        return None
+    returns = [
+        math.log(window[i][1] / window[i - 1][1])
+        for i in range(1, len(window))
+        if window[i - 1][1] > 0 and window[i][1] > 0
+    ]
+    if len(returns) < 3:
+        return None
+    return math.sqrt(sum(r * r for r in returns)) * 100.0
+
+
+def _range_pct(window: list[tuple[float, float]]) -> float | None:
+    if len(window) < 2:
+        return None
+    prices = [price for _, price in window]
+    low = min(prices)
+    high = max(prices)
+    return None if low <= 0 else (high / low - 1.0) * 100.0
+
+
+def _up_tick_ratio(window: list[tuple[float, float]]) -> float | None:
+    if len(window) < 3:
+        return None
+    deltas = [
+        window[i][1] - window[i - 1][1]
+        for i in range(1, len(window))
+        if window[i][1] != window[i - 1][1]
+    ]
+    if not deltas:
+        return None
+    return sum(delta > 0 for delta in deltas) / len(deltas)
+
+
+def _trend_pct_per_min(window: list[tuple[float, float]]) -> float | None:
+    if len(window) < 4:
+        return None
+    t0 = window[0][0]
+    xs = [(ts - t0) / 60.0 for ts, _ in window]
+    ys = [math.log(price) for _, price in window if price > 0]
+    if len(ys) != len(xs):
+        return None
+    xbar = statistics.fmean(xs)
+    ybar = statistics.fmean(ys)
+    denom = sum((x - xbar) ** 2 for x in xs)
+    if denom <= 0:
+        return None
+    slope = sum((x - xbar) * (y - ybar) for x, y in zip(xs, ys, strict=True)) / denom
+    return slope * 100.0
+
+
+def _remaining_vol_and_z(
+    points: list[tuple[float, float]],
+    *,
+    target_price: float | None,
+    current_price: float | None,
+    seconds_left: int | None,
+) -> tuple[float | None, float | None]:
+    recent = points[-301:]
+    if len(recent) < 5 or target_price is None or current_price is None or not seconds_left:
+        return None, None
+    sum_sq = 0.0
+    elapsed = 0.0
+    for i in range(1, len(recent)):
+        dt = recent[i][0] - recent[i - 1][0]
+        if dt <= 0:
+            continue
+        r = math.log(recent[i][1] / recent[i - 1][1])
+        sum_sq += r * r
+        elapsed += dt
+    if elapsed <= 0 or sum_sq <= 0:
+        return None, None
+    variance_rate = sum_sq / elapsed
+    remaining_sigma = math.sqrt(variance_rate * seconds_left)
+    if remaining_sigma <= 0:
+        return None, None
+    distance = math.log(current_price / target_price)
+    return remaining_sigma * 100.0, distance / remaining_sigma
+
+
+def compute_path_features(
+    samples: list[dict[str, Any]],
+    *,
+    history_source: str,
+    captured_at: datetime,
+    target_price: float | None,
+    current_price: float | None,
+    seconds_left: int | None,
+    min_history_seconds: int = 60,
+    max_sample_age_seconds: float = 5.0,
+) -> PricePathFeatures:
+    points = _normalize_samples(samples)
+    end_ts = captured_at.timestamp()
+    latest_age = max(0.0, end_ts - points[-1][0]) if points else None
+    history_span = int(points[-1][0] - points[0][0]) if len(points) >= 2 else 0
+
+    w60 = _window_points(points, end_ts, 60)
+    w180 = _window_points(points, end_ts, 180)
+    w300 = _window_points(points, end_ts, 300)
+    remaining_vol, distance_z = _remaining_vol_and_z(
+        points,
+        target_price=target_price,
+        current_price=current_price,
+        seconds_left=seconds_left,
+    )
+
+    feature_ready = (
+        len(points) >= 4
+        and history_span >= min_history_seconds
+        and latest_age is not None
+        and latest_age <= max_sample_age_seconds
+        and _realized_vol_pct(w60) is not None
+    )
+
+    return PricePathFeatures(
+        history_source=history_source,
+        sample_count=len(points),
+        history_span_seconds=history_span,
+        latest_sample_age_seconds=latest_age,
+        return_30s_pct=_return_pct(points, end_ts, 30),
+        return_60s_pct=_return_pct(points, end_ts, 60),
+        return_180s_pct=_return_pct(points, end_ts, 180),
+        return_300s_pct=_return_pct(points, end_ts, 300),
+        realized_vol_60s_pct=_realized_vol_pct(w60),
+        realized_vol_180s_pct=_realized_vol_pct(w180),
+        realized_vol_300s_pct=_realized_vol_pct(w300),
+        range_60s_pct=_range_pct(w60),
+        range_180s_pct=_range_pct(w180),
+        range_300s_pct=_range_pct(w300),
+        up_tick_ratio_60s=_up_tick_ratio(w60),
+        trend_60s_pct_per_min=_trend_pct_per_min(w60),
+        trend_180s_pct_per_min=_trend_pct_per_min(w180),
+        remaining_vol_pct=remaining_vol,
+        distance_z=distance_z,
+        feature_ready=feature_ready,
+    )
 
 
 async def fetch_short_term_snapshots(
@@ -247,51 +482,64 @@ async def fetch_short_term_snapshots(
     now: datetime | None = None,
     timeout_seconds: float = 3.0,
 ) -> dict[str, ShortTermSnapshot]:
-    """Build authoritative snapshots. Missing Chainlink anchors stay missing."""
-    requested_at = now
-    timeframes = {market_timeframe(c.market, settings) for c in candidates}
-    chainlink_windows = {
-        chainlink_twap_window_seconds(candidate)
-        for candidate in candidates
-        if market_timeframe(candidate.market, settings) in {"5m", "15m"}
-    }
-    need_binance = "1h" in timeframes
-
-    chainlink_prices, binance_price = await fetch_reference_prices(
-        client,
-        chainlink_windows=chainlink_windows,
-        need_binance=need_binance,
-        timeout_seconds=timeout_seconds,
-    )
-
-    hour_targets: dict[str, tuple[float | None, str | None]] = {}
-    hour_candidates = [
-        candidate for candidate in candidates
-        if market_timeframe(candidate.market, settings) == "1h"
-    ]
-    if hour_candidates:
-        async with httpx.AsyncClient(timeout=4.0, follow_redirects=True) as http:
-            for candidate in hour_candidates:
-                window = market_window(candidate.market, settings)
-                if window is not None:
-                    hour_targets[candidate.slug] = await fetch_hour_target(
-                        http, candidate.slug, window[0]
-                    )
-
-    captured_at = requested_at or datetime.now(UTC)
+    """Build authoritative snapshots plus recent price-path features."""
+    captured_at = now or datetime.now(UTC)
     if captured_at.tzinfo is None:
         captured_at = captured_at.replace(tzinfo=UTC)
     else:
         captured_at = captured_at.astimezone(UTC)
 
+    chainlink_windows = {
+        chainlink_twap_window_seconds(candidate)
+        for candidate in candidates
+        if market_timeframe(candidate.market, settings) in {"5m", "15m"}
+    }
+    chainlink_prices = await fetch_chainlink_twap_prices(
+        client,
+        windows=chainlink_windows,
+        timeout_seconds=timeout_seconds,
+    )
+
+    need_hour = any(
+        market_timeframe(candidate.market, settings) == "1h"
+        for candidate in candidates
+    )
+    binance_current: float | None = None
+    binance_history: list[dict[str, float]] = []
+    hour_targets: dict[str, float | None] = {}
+    if need_hour:
+        async with httpx.AsyncClient(timeout=4.0, follow_redirects=True) as http:
+            binance_current, binance_history = await asyncio.gather(
+                fetch_binance_current(http),
+                fetch_binance_recent_history(http),
+            )
+            if binance_current is not None:
+                binance_history.append({
+                    "ts": captured_at.timestamp(),
+                    "price": binance_current,
+                })
+            for candidate in candidates:
+                if market_timeframe(candidate.market, settings) != "1h":
+                    continue
+                window = market_window(candidate.market, settings)
+                if window is not None:
+                    hour_targets[candidate.slug] = await fetch_binance_hour_open(http, window[0])
+
     snapshots: dict[str, ShortTermSnapshot] = {}
     for candidate in candidates:
         timeframe = market_timeframe(candidate.market, settings)
         window = market_window(candidate.market, settings)
+        seconds_left = (
+            max(0, int((window[1] - captured_at).total_seconds()))
+            if window is not None else None
+        )
 
         target: float | None = None
         target_source: str | None = None
+        current: float | None = None
+        current_source: str | None = None
         twap_window: int | None = None
+        features: PricePathFeatures | None = None
 
         if timeframe in {"5m", "15m"}:
             twap_window = chainlink_twap_window_seconds(candidate)
@@ -301,20 +549,42 @@ async def fetch_short_term_snapshots(
                 target_source = str(anchor["source"])
             current = chainlink_prices.get(twap_window)
             current_source = (
-                f"Chainlink BTC/USD TWAP {twap_window}s"
+                f"Polymarket RTDS · Chainlink BTC/USD TWAP {twap_window}s"
                 if current is not None else None
             )
-        elif timeframe == "1h":
-            target, target_source = hour_targets.get(candidate.slug, (None, None))
-            current = binance_price
-            current_source = "Binance BTC/USDT" if current is not None else None
-        else:
-            current = None
-            current_source = None
+            samples = (
+                store.get_price_samples(
+                    source="chainlink_spot",
+                    since_ts=captured_at.timestamp() - 330,
+                )
+                if store else []
+            )
+            features = compute_path_features(
+                samples,
+                history_source="Polymarket RTDS · Chainlink BTC/USD raw",
+                captured_at=captured_at,
+                target_price=target,
+                current_price=current,
+                seconds_left=seconds_left,
+                min_history_seconds=settings.short_term_min_history_seconds,
+                max_sample_age_seconds=settings.short_term_max_sample_age_seconds,
+            )
 
-        seconds_left = None
-        if window is not None:
-            seconds_left = max(0, int((window[1] - captured_at).total_seconds()))
+        elif timeframe == "1h":
+            target = hour_targets.get(candidate.slug)
+            target_source = "Binance API · BTCUSDT 1H open" if target is not None else None
+            current = binance_current
+            current_source = "Binance API · BTCUSDT" if current is not None else None
+            features = compute_path_features(
+                binance_history,
+                history_source="Binance API · BTCUSDT 1m K线",
+                captured_at=captured_at,
+                target_price=target,
+                current_price=current,
+                seconds_left=seconds_left,
+                min_history_seconds=settings.short_term_min_history_seconds,
+                max_sample_age_seconds=65.0,
+            )
 
         snapshots[candidate.slug] = ShortTermSnapshot(
             target_price=target,
@@ -324,6 +594,7 @@ async def fetch_short_term_snapshots(
             current_source=current_source,
             captured_at=captured_at,
             twap_window_seconds=twap_window,
+            path_features=features,
         )
 
     return snapshots
@@ -370,7 +641,7 @@ def record_chainlink_anchor_event(
             twap_window=twap_window,
             price=price,
             observed_ts=observed_ts,
-            source=f"Chainlink BTC/USD TWAP {twap_window}s 起始捕获",
+            source=f"Polymarket RTDS · Chainlink BTC/USD TWAP {twap_window}s 起始捕获",
         )
         if inserted:
             inserted_slugs.append(slug)
@@ -390,7 +661,7 @@ async def watch_chainlink_anchors(
     *,
     on_capture: Callable[[str, int, float], None] | None = None,
 ) -> None:
-    """Continuously capture trusted 5m/15m Chainlink anchors at window boundaries."""
+    """Capture Chainlink anchors and raw BTC/USD history continuously."""
     if not any(
         value.strip().lower() in {"5m", "15m"}
         for value in settings.allowed_timeframes.split(",")
@@ -398,9 +669,11 @@ async def watch_chainlink_anchors(
         return
 
     specs = [
+        CryptoPricesSpec(topic="prices.crypto.chainlink", symbols=["btc/usd"]),
         CryptoPricesChainlinkTwapSpec(window_seconds=30, symbols=["btc/usd"]),
         CryptoPricesChainlinkTwapSpec(window_seconds=60, symbols=["btc/usd"]),
     ]
+    last_prune = 0.0
 
     while True:
         client = AsyncPublicClient()
@@ -411,21 +684,41 @@ async def watch_chainlink_anchors(
                     price = _float_or_none(event.payload.value)
                     if price is None:
                         continue
-                    twap_window = int(event.payload.window_seconds)
-                    inserted_slugs = record_chainlink_anchor_event(
-                        settings,
-                        store,
-                        observed=observed,
-                        price=price,
-                        twap_window=twap_window,
-                    )
-                    if on_capture is not None:
-                        for slug in inserted_slugs:
-                            on_capture(slug, twap_window, price)
+                    observed_ts = observed.timestamp()
+
+                    if event.topic == "prices.crypto.chainlink":
+                        store.put_price_sample(
+                            source="chainlink_spot",
+                            price=price,
+                            observed_ts=observed_ts,
+                        )
+                    elif event.topic == "prices.crypto.chainlink.twap":
+                        twap_window = int(event.payload.window_seconds)
+                        store.put_price_sample(
+                            source="chainlink_twap",
+                            twap_window=twap_window,
+                            price=price,
+                            observed_ts=observed_ts,
+                        )
+                        inserted_slugs = record_chainlink_anchor_event(
+                            settings,
+                            store,
+                            observed=observed,
+                            price=price,
+                            twap_window=twap_window,
+                        )
+                        if on_capture is not None:
+                            for slug in inserted_slugs:
+                                on_capture(slug, twap_window, price)
+
+                    if observed_ts - last_prune >= 300:
+                        store.prune_price_samples(observed_ts - 21_600)
+                        last_prune = observed_ts
+
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001
-            log.warning("Chainlink 起始价监听断开：%s；3 秒后重连", exc)
+            log.warning("Chainlink 实时价格监听断开：%s；3 秒后重连", exc)
             await asyncio.sleep(3)
         finally:
             await client.close()
