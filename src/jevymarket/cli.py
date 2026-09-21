@@ -17,6 +17,7 @@ from .jev import JevClient, JevError, choice, noul, score
 from .market_data import ShortTermSnapshot, fetch_short_term_snapshots, watch_chainlink_anchors
 from .markets import TIMEFRAME_LABELS, Candidate, fetch_book, load_candidate, market_timeframe, scan
 from .research import Brief, Researcher, ResearchError
+from .settlement import settle_pending_markets
 from .signal import Trade, evaluate, get_brief, market_data_and_ask, quantitative_up_probability
 from .store import Store
 
@@ -282,6 +283,9 @@ def run(
     from .executor import Executor
 
     async def one_pass(store: Store, ex: Executor, pub: AsyncPublicClient, jev: JevClient):
+        settled = await settle_pending_markets(pub, s, store, limit=40)
+        if settled:
+            console.print(f"[dim]已自动回填 {settled} 个已结算短周期市场[/]")
         cands = await scan(pub, s, limit=limit)
         snapshots = await fetch_short_term_snapshots(pub, cands, s, store=store)
         console.rule(
@@ -477,17 +481,85 @@ def positions():
 
 @app.command()
 def stats():
-    """Decision/order counts and a rough Jev-vs-market calibration table."""
+    """自动回填结算结果，并显示概率质量与模拟交易表现。"""
     s = _settings()
-    st = Store(s.db_path).stats()
-    console.print(f"决策数={st['decisions']} 交易信号={st['trade_signals']} 研究摘要={st['briefs']} "
-                  f"真实订单={st['live_orders']} 真实金额=${st['live_usd']:.2f}")
-    t = Table(title="交易概率分桶 vs 市场中间价")
-    for col in ("概率区间", "样本数", "Jev均值", "市场均值"):
-        t.add_column(col, justify="right")
-    for b in st["buckets"]:
-        t.add_row(f"{b['b']/10:.1f}-{(b['b']+1)/10:.1f}", str(b["n"]), f"{b['avg_p']:.2f}", f"{b['avg_mkt']:.2f}")
+    from polymarket import AsyncPublicClient
+
+    async def go():
+        store = Store(s.db_path)
+        try:
+            async with AsyncPublicClient() as client:
+                settled = await settle_pending_markets(
+                    client, s, store, limit=500, grace_seconds=15.0
+                )
+            return settled, store.stats()
+        finally:
+            store.close()
+
+    settled, st = _run(go())
+    if settled:
+        console.print(f"[green]本次新增回填 {settled} 个已结算市场[/]")
+
+    console.print(
+        f"决策数={st['decisions']} 交易信号={st['trade_signals']} "
+        f"已结算市场={st['resolved_markets']} 模拟订单={st['dry_orders']} "
+        f"真实订单={st['live_orders']} 真实金额=${st['live_usd']:.2f}"
+    )
+
+    t = Table(title="概率模型对比（只统计已有官方结算结果的决策快照）")
+    for col in ("模型", "样本", "Brier↓", "LogLoss↓", "方向命中率"):
+        t.add_column(col, justify="right" if col != "模型" else "left")
+    for row in st["model_comparison"]:
+        t.add_row(
+            row["model"],
+            str(row["n"]),
+            _fmt_metric(row["brier"], 4),
+            _fmt_metric(row["log_loss"], 4),
+            _fmt_percent(row["accuracy"]),
+        )
     console.print(t)
+
+    perf = st["dry_run_performance"]
+    console.print(
+        "[bold]模拟交易表现（按实际 dry-run 订单，未计手续费/滑点）：[/] "
+        f"已结算 {perf['trades']} 笔，赢 {perf['wins']} 笔，"
+        f"命中率 {_fmt_percent(perf['hit_rate'])}，"
+        f"投入 ${perf['stake_usd']:.2f}，"
+        f"毛PnL {perf['pnl_usd']:+.2f}，ROI {_fmt_percent(perf['roi'])}"
+    )
+
+    t2 = Table(title="交易概率分桶 vs 当时市场中间价")
+    for col in ("概率区间", "样本数", "量化均值", "市场均值"):
+        t2.add_column(col, justify="right")
+    for b in st["buckets"]:
+        upper = min(1.0, (b["b"] + 1) / 10)
+        t2.add_row(
+            f"{b['b']/10:.1f}-{upper:.1f}",
+            str(b["n"]),
+            f"{b['avg_p']:.2f}",
+            f"{b['avg_mkt']:.2f}",
+        )
+    console.print(t2)
+
+
+@app.command("settle")
+def settle_cmd():
+    """只执行一次官方结算结果回填，不运行交易。"""
+    s = _settings()
+    from polymarket import AsyncPublicClient
+
+    async def go():
+        store = Store(s.db_path)
+        try:
+            async with AsyncPublicClient() as client:
+                return await settle_pending_markets(
+                    client, s, store, limit=500, grace_seconds=15.0
+                )
+        finally:
+            store.close()
+
+    n = _run(go())
+    console.print(f"已新增回填 {n} 个市场结果")
 
 
 # ---------------------------------------------------------------------------
@@ -535,6 +607,14 @@ def _fmt_pct(value: float | None) -> str:
 
 def _fmt_num(value: float | None, digits: int = 2) -> str:
     return "—" if value is None else f"{value:+.{digits}f}"
+
+
+def _fmt_metric(value: float | None, digits: int = 4) -> str:
+    return "—" if value is None else f"{value:.{digits}f}"
+
+
+def _fmt_percent(value: float | None) -> str:
+    return "—" if value is None else f"{value * 100:.1f}%"
 
 
 def _snapshot_not_ready_reason(snapshot: ShortTermSnapshot | None) -> str:
@@ -680,6 +760,8 @@ def _decision_row(
     return dict(
         slug=c.slug, condition_id=c.condition_id, question=c.question, state_json=state,
         p_yes=(v.p_yes if signal_p_yes is None else signal_p_yes),
+        jev_p_yes=v.p_yes,
+        timeframe=market_timeframe(c.market, _settings()),
         answerable=v.answerable, clarity=v.clarity,
         yes_ask=c.book.yes_ask, no_ask=c.book.no_ask, midpoint=c.book.midpoint,
         edge=result.edge if is_trade else None,
