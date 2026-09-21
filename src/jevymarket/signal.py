@@ -32,8 +32,9 @@ CLARITY_LEVELS = [
 
 QUESTIONS = {
     "resolves_yes": noul(
-        "Given the market question, its description and resolution rules, this market "
-        "will resolve YES. If `market_start_date` is present, treat events before that date "
+        "Estimate the probability that the FIRST listed market outcome, provided as "
+        "`primary_outcome` in state, will win. For the BTC short-term markets this is UP. "
+        "If `market_start_date` is present, treat events before that date "
         "as background unless the resolution rules explicitly require a lookback. If an "
         "`evidence` brief is present, weigh its dated facts and latest development against "
         "`days_until_resolution`."
@@ -76,6 +77,8 @@ class Book:
     no_ask: float | None
     tick_size: float
     min_order_size: float
+    yes_label: str = "YES"
+    no_label: str = "NO"
 
     @property
     def midpoint(self) -> float | None:
@@ -92,7 +95,7 @@ class Book:
 
 @dataclass(frozen=True)
 class Trade:
-    outcome: str           # "YES" | "NO"
+    outcome: str           # market outcome label, e.g. "UP" | "DOWN"
     token_id: str
     side: str              # always "BUY" in v1
     price: float           # limit price, rounded to tick
@@ -148,34 +151,34 @@ def kelly_fraction(p: float, price: float) -> float:
 
 def evaluate(view: JevView, book: Book, s: Settings, bankroll_usd: float | None = None) -> Trade | Skip:
     if view.answerable < s.min_answerable:
-        return Skip(f"answerable {view.answerable:.2f} < {s.min_answerable}")
+        return Skip(f"信息充分度 {view.answerable:.2f} < 阈值 {s.min_answerable}")
     if view.clarity < s.min_clarity:
-        return Skip(f"clarity {view.clarity} < {s.min_clarity}")
+        return Skip(f"结算规则清晰度 {view.clarity} < 阈值 {s.min_clarity}")
 
     candidates: list[tuple[str, str, float, float]] = []  # outcome, token, p, ask
     if book.yes_ask is not None:
-        candidates.append(("YES", book.yes_token_id, view.p_yes, book.yes_ask))
+        candidates.append((book.yes_label.upper(), book.yes_token_id, view.p_yes, book.yes_ask))
     if book.no_ask is not None:
-        candidates.append(("NO", book.no_token_id, 1 - view.p_yes, book.no_ask))
+        candidates.append((book.no_label.upper(), book.no_token_id, 1 - view.p_yes, book.no_ask))
     if not candidates:
-        return Skip("no asks on either side")
+        return Skip("两个方向都没有可成交卖价")
     in_band = [c for c in candidates if s.min_trade_price <= c[3] <= s.max_trade_price]
     if not in_band:
         asks = ", ".join(f"{o} ask {a:.2f}" for o, _, _, a in candidates)
-        return Skip(f"outside trade band [{s.min_trade_price}, {s.max_trade_price}]: {asks}")
+        return Skip(f"价格超出交易区间 [{s.min_trade_price}, {s.max_trade_price}]: {asks}")
     candidates = in_band
 
     outcome, token, p, ask = max(candidates, key=lambda c: c[2] - c[3])
     edge = p - ask
     if edge < s.min_edge:
-        return Skip(f"best edge {edge:+.3f} ({outcome} p={p:.2f} ask={ask:.2f}) < {s.min_edge}")
+        return Skip(f"最佳优势 {edge:+.3f}（{outcome} 模型概率={p:.2f} 卖价={ask:.2f}）< 阈值 {s.min_edge}")
 
     # Sizing: fractional Kelly on the bankroll, hard-capped per trade.
     bankroll = bankroll_usd if bankroll_usd is not None else s.max_open_exposure_usd
     f = kelly_fraction(p, ask) * s.kelly_fraction
     usd = min(s.max_usd_per_trade, f * bankroll)
     if usd <= 0:
-        return Skip("kelly sizing gave zero")
+        return Skip("凯利仓位计算结果为 0")
 
     price = round_to_tick(ask, book.tick_size)
     size = math.floor(usd / price * 100) / 100  # 2-dp shares
@@ -184,7 +187,7 @@ def evaluate(view: JevView, book: Book, s: Settings, bankroll_usd: float | None 
     usd = round(price * size, 4)
     if usd > s.max_usd_per_trade * 1.5:
         # min_order_size forced us well past the cap; refuse.
-        return Skip(f"min order size {book.min_order_size} x {price} = ${usd:.2f} exceeds cap")
+        return Skip(f"最小下单量 {book.min_order_size} × {price} = ${usd:.2f} 超过单笔上限")
 
     return Trade(
         outcome=outcome,
@@ -196,8 +199,8 @@ def evaluate(view: JevView, book: Book, s: Settings, bankroll_usd: float | None 
         p=p,
         edge=edge,
         rationale=(
-            f"Jev P({outcome})={p:.2f} vs ask {ask:.2f} -> edge {edge:+.2f}; "
-            f"answerable={view.answerable:.2f} clarity={view.clarity}"
+            f"Jev P({outcome})={p:.2f}，卖价={ask:.2f}，优势={edge:+.2f}；"
+            f"信息充分度={view.answerable:.2f}，规则清晰度={view.clarity}"
         ),
     )
 
