@@ -146,7 +146,7 @@ class JevClient:
         if self._own_client:
             await self._client.aclose()
 
-    async def __aenter__(self) -> "JevClient":
+    async def __aenter__(self) -> JevClient:
         return self
 
     async def __aexit__(self, *exc) -> None:
