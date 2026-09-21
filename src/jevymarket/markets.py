@@ -173,6 +173,8 @@ def build_state(c: Candidate, s: Settings, brief: Brief | None = None) -> dict:
         "today": datetime.now(UTC).date().isoformat(),
         "days_until_resolution": c.days_to_resolution,
     }
+    if m.state.start_date:
+        state["market_start_date"] = m.state.start_date.date().isoformat()
     if m.resolution and m.resolution.source:
         state["resolution_source"] = m.resolution.source
     mid = c.book.midpoint
