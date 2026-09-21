@@ -15,7 +15,7 @@ from . import __version__
 from .config import Settings, load_settings
 from .jev import JevClient, JevError, choice, noul, score
 from .market_data import ShortTermSnapshot, fetch_short_term_snapshots, watch_chainlink_anchors
-from .markets import TIMEFRAME_LABELS, Candidate, load_candidate, market_timeframe, scan
+from .markets import TIMEFRAME_LABELS, Candidate, fetch_book, load_candidate, market_timeframe, scan
 from .research import Brief, Researcher, ResearchError
 from .signal import Trade, evaluate, get_brief, market_data_and_ask, quantitative_up_probability
 from .store import Store
@@ -217,27 +217,45 @@ def decide(ref: str = typer.Argument(..., help="市场 slug 或 polymarket.com U
                 state, view = await market_data_and_ask(cand, s, jev, snapshot)
                 if show_state:
                     console.print_json(json.dumps(state, ensure_ascii=False, default=str))
-                quant_p = quantitative_up_probability(snapshot)
+                fresh_book = await fetch_book(c, cand.market)
+                fresh_cand = Candidate(market=cand.market, book=fresh_book)
+                fresh_snapshots = await fetch_short_term_snapshots(
+                    c, [fresh_cand], s, store=store
+                )
+                fresh_snapshot = fresh_snapshots.get(fresh_cand.slug)
+                if fresh_snapshot is None or not fresh_snapshot.trade_ready:
+                    console.print(
+                        f"[yellow]Jev 返回后行情已变化，跳过："
+                        f"{_snapshot_not_ready_reason(fresh_snapshot)}[/]"
+                    )
+                    return
+
+                quant_p = quantitative_up_probability(fresh_snapshot)
                 if quant_p is None:
-                    console.print("[yellow]跳过：无法从价格路径计算量化上涨概率。[/]")
+                    console.print("[yellow]跳过：无法从最新价格路径计算量化上涨概率。[/]")
                     return
                 state["quantitative_signal"] = {
                     "p_up": quant_p,
                     "method": "normal_cdf(distance_z)",
+                    "execution_snapshot": fresh_snapshot.to_state(),
                 }
                 result = evaluate(
                     view,
-                    cand.book,
+                    fresh_cand.book,
                     s,
                     probability_yes=quant_p,
                     probability_source="量化Φ(Z)",
                 )
                 _print_decision(
-                    cand, view, result, snapshot=snapshot, quant_p_yes=quant_p
+                    fresh_cand,
+                    view,
+                    result,
+                    snapshot=fresh_snapshot,
+                    quant_p_yes=quant_p,
                 )
                 store.log_decision(
                     **_decision_row(
-                        cand, state, view, result, brief=None, executed=False,
+                        fresh_cand, state, view, result, brief=None, executed=False,
                         signal_p_yes=quant_p,
                     )
                 )
@@ -299,28 +317,46 @@ def run(
                     raise
                 continue
 
-            quant_p = quantitative_up_probability(snapshot)
+            fresh_book = await fetch_book(pub, cand.market)
+            fresh_cand = Candidate(market=cand.market, book=fresh_book)
+            fresh_snapshots = await fetch_short_term_snapshots(
+                pub, [fresh_cand], s, store=store
+            )
+            fresh_snapshot = fresh_snapshots.get(fresh_cand.slug)
+            if fresh_snapshot is None or not fresh_snapshot.trade_ready:
+                console.print(
+                    f"  [yellow]Jev 返回后行情已变化，跳过："
+                    f"{_snapshot_not_ready_reason(fresh_snapshot)}[/]"
+                )
+                continue
+
+            quant_p = quantitative_up_probability(fresh_snapshot)
             if quant_p is None:
-                console.print("  [yellow]跳过：无法从价格路径计算量化上涨概率。[/]")
+                console.print("  [yellow]跳过：无法从最新价格路径计算量化上涨概率。[/]")
                 continue
 
             state["quantitative_signal"] = {
                 "p_up": quant_p,
                 "method": "normal_cdf(distance_z)",
+                "execution_snapshot": fresh_snapshot.to_state(),
             }
             result = evaluate(
                 view,
-                cand.book,
+                fresh_cand.book,
                 s,
                 probability_yes=quant_p,
                 probability_source="量化Φ(Z)",
             )
             _print_decision(
-                cand, view, result, snapshot=snapshot, quant_p_yes=quant_p
+                fresh_cand,
+                view,
+                result,
+                snapshot=fresh_snapshot,
+                quant_p_yes=quant_p,
             )
             executed = False
             if isinstance(result, Trade):
-                placed = await ex.place(cand, result)
+                placed = await ex.place(fresh_cand, result)
                 executed = placed.ok
                 if not placed.ok:
                     console.print(f"  [yellow]{_status_cn(placed.status)}：{placed.message}[/]")
@@ -332,7 +368,7 @@ def run(
 
             store.log_decision(
                 **_decision_row(
-                    cand, state, view, result, brief=None, executed=executed,
+                    fresh_cand, state, view, result, brief=None, executed=executed,
                     signal_p_yes=quant_p,
                 )
             )
