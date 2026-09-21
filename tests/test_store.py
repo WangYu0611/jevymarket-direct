@@ -122,3 +122,31 @@ def test_resolved_model_and_strategy_metrics(tmp_path):
     assert perf["wins"] == 1
     assert perf["pnl_usd"] > 0
     st.close()
+
+
+
+def test_evaluation_checkpoint_is_unique_per_version(tmp_path):
+    st = Store(tmp_path / "t.db")
+    kwargs = dict(
+        slug="btc-updown-5m-1",
+        condition_id="c",
+        timeframe="5m",
+        strategy_version="v2",
+        checkpoint_seconds=120,
+        seconds_left=115,
+        quant_p=0.6,
+        jev_p=0.55,
+        market_p=0.58,
+        yes_ask=0.59,
+        no_ask=0.42,
+        book_json={"directional_imbalance_5c": 0.2},
+        state_json={"timeframe": "5m"},
+    )
+    assert st.log_evaluation_sample(**kwargs)
+    assert not st.log_evaluation_sample(**kwargs)
+    assert st.evaluation_sample_count("v2") == 1
+
+    kwargs["strategy_version"] = "v3"
+    assert st.log_evaluation_sample(**kwargs)
+    assert st.evaluation_sample_count() == 2
+    st.close()
