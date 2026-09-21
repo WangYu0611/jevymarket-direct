@@ -59,12 +59,12 @@ def test_skips_when_edge_too_small():
 
 def test_skips_when_not_answerable():
     r = evaluate(_view(answerable=0.3), _book(), _settings())
-    assert isinstance(r, Skip) and "answerable" in r.reason
+    assert isinstance(r, Skip) and "信息充分度" in r.reason
 
 
 def test_skips_when_unclear():
     r = evaluate(_view(clarity=1), _book(), _settings(min_clarity=2))
-    assert isinstance(r, Skip) and "clarity" in r.reason
+    assert isinstance(r, Skip) and "规则清晰度" in r.reason
 
 
 def test_per_trade_cap_respected():
@@ -81,7 +81,7 @@ def test_refuses_when_min_size_blows_cap():
 def test_refuses_longshots_outside_band():
     # Jev says 15% NO vs a 6-cent ask: "edge" 0.09, but the ask is outside the band.
     r = evaluate(_view(p_yes=0.85), _book(yes_ask=0.94, yes_bid=0.93), _settings())
-    assert isinstance(r, Skip) and "band" in r.reason
+    assert isinstance(r, Skip) and "交易区间" in r.reason
     # Widening the band lets it through.
     t = evaluate(_view(p_yes=0.85), _book(yes_ask=0.94, yes_bid=0.93), _settings(min_trade_price=0.01))
     assert isinstance(t, Trade) and t.outcome == "NO"
