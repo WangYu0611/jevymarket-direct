@@ -76,7 +76,7 @@ class Brief:
     raw: dict = field(default_factory=dict)
 
     @classmethod
-    def from_json(cls, data: dict, model: str = "", cost: float = 0.0, raw: dict | None = None) -> "Brief":
+    def from_json(cls, data: dict, model: str = "", cost: float = 0.0, raw: dict | None = None) -> Brief:
         def _list(x) -> list[str]:
             if isinstance(x, list):
                 return [str(i).strip() for i in x if str(i).strip()]
@@ -171,7 +171,7 @@ class Researcher:
         if self._own_client:
             await self._client.aclose()
 
-    async def __aenter__(self) -> "Researcher":
+    async def __aenter__(self) -> Researcher:
         return self
 
     async def __aexit__(self, *exc) -> None:
