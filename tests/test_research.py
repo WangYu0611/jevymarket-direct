@@ -63,15 +63,18 @@ async def test_brief_search_then_json_mode():
     search = respx.post(SEARCH_URL).mock(return_value=httpx.Response(200, json=_search_resp()))
     formatter = respx.post(JSON_URL).mock(return_value=httpx.Response(200, json=_json_resp()))
     async with Researcher(api_key="k", max_calls=2) as r:
-        b = await r.brief("Q?", "desc", None, "2026-09-30", "2026-09-20")
+        b = await r.brief("Q?", "desc", None, "2026-09-17", "2026-09-30", "2026-09-20")
 
     search_body = json.loads(search.calls[0].request.content)
     assert search_body["tools"][0]["type"] == "web_search_20250305"
     assert "polymarket.com" in search_body["tools"][0]["blocked_domains"]
+    assert "Market start date: 2026-09-17" in search_body["messages"][0]["content"][0]["text"]
 
     format_body = json.loads(formatter.calls[0].request.content)
     assert format_body["response_format"] == {"type": "json_object"}
     assert format_body["thinking"] == {"type": "disabled"}
+    formatter_context = json.loads(format_body["messages"][1]["content"])
+    assert formatter_context["market_start_date"] == "2026-09-17"
 
     assert b.summary == BRIEF["summary"]
     assert b.sources == ["https://example.com/a", "https://example.com/b"]
@@ -86,7 +89,7 @@ async def test_no_native_search_result_is_rejected():
     respx.post(SEARCH_URL).mock(return_value=httpx.Response(200, json=response))
     async with Researcher(api_key="k") as r:
         with pytest.raises(ResearchError, match="web_search_tool_result"):
-            await r.brief("Q?", "d", None, None, "2026-09-20")
+            await r.brief("Q?", "d", None, "2026-09-17", None, "2026-09-20")
 
 
 @respx.mock
@@ -96,7 +99,7 @@ async def test_excluded_domain_leak_is_rejected():
     respx.post(SEARCH_URL).mock(return_value=httpx.Response(200, json=bad))
     async with Researcher(api_key="k") as r:
         with pytest.raises(ResearchError, match="excluded-domain"):
-            await r.brief("Q?", "d", None, None, "2026-09-20")
+            await r.brief("Q?", "d", None, "2026-09-17", None, "2026-09-20")
 
 
 def test_to_state_trims_to_max_chars():
