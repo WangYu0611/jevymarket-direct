@@ -41,7 +41,10 @@ class Settings(BaseSettings):
 
     # --- market filter -----------------------------------------------------
     # Comma-separated crypto asset whitelist. Empty string disables the asset filter.
-    allowed_assets: str = "BTC,ETH,SOL"
+    allowed_assets: str = "BTC"
+    allowed_timeframes: str = "5m,15m,1h"
+    short_term_min_liquidity_usd: float = 0.0
+    short_term_min_volume_usd: float = 0.0
     min_liquidity_usd: float = 5_000
     min_volume_usd: float = 10_000
     max_days_to_resolution: int = 60
