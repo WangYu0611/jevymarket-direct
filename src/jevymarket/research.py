@@ -38,6 +38,7 @@ Rules:
 - Every material fact should carry a date (YYYY-MM-DD) when available.
 - Do not restate the market's resolution rules as facts.
 - Report the most recent development and the key factual considerations on both sides.
+- If a market_start_date is supplied, facts before that date are background only unless the resolution rules explicitly require a pre-start lookback. Do not use pre-start facts as primary evidence for whether an event occurred during the market window.
 - Do NOT estimate a probability, say what you would bet, or summarize market odds.
 - Return a concise factual research memo after the web search. JSON is NOT required in this stage.
 """
@@ -57,6 +58,7 @@ estimate probability, or invent source URLs. Output exactly one JSON object with
 }
 
 The `sources` field may contain only URLs from the supplied allowed-source list.
+If `market_start_date` is supplied, exclude facts before that date from `key_facts`, `latest_development`, `for_yes`, and `against_yes` unless the resolution rules explicitly require a pre-start lookback. Older facts may only inform minimal background in `summary`.
 If evidence is missing, use empty lists/strings rather than inventing information.
 """
 
@@ -196,7 +198,7 @@ class Researcher:
         return self.max_calls is None or self.calls < self.max_calls
 
     def _user_prompt(self, question: str, description: str, resolution_source: str | None,
-                     end_date: str | None, today: str) -> str:
+                     start_date: str | None, end_date: str | None, today: str) -> str:
         parts = [
             f"Research the latest news and official statements relevant to: {question}",
             f"Today is {today}.",
@@ -204,13 +206,15 @@ class Researcher:
         ]
         if resolution_source:
             parts.append(f"Stated resolution source: {resolution_source}")
+        if start_date:
+            parts.append(f"Market start date: {start_date}. Treat earlier events as background only unless the rules explicitly require a lookback.")
         if end_date:
             parts.append(f"Market end date: {end_date}")
         parts.append("Use web_search before answering. Return a factual memo, not a probability.")
         return "\n\n".join(parts)
 
     async def brief(self, question: str, description: str, resolution_source: str | None,
-                    end_date: str | None, today: str) -> Brief:
+                    start_date: str | None, end_date: str | None, today: str) -> Brief:
         if not self.budget_left:
             raise ResearchError(0, f"research budget of {self.max_calls} calls for this run exhausted")
 
@@ -230,7 +234,7 @@ class Researcher:
                 "role": "user",
                 "content": [{
                     "type": "text",
-                    "text": self._user_prompt(question, description, resolution_source, end_date, today),
+                    "text": self._user_prompt(question, description, resolution_source, start_date, end_date, today),
                 }],
             }],
             "tools": [web_tool],
@@ -262,6 +266,7 @@ class Researcher:
             question=question,
             description=description,
             resolution_source=resolution_source,
+            start_date=start_date,
             end_date=end_date,
             today=today,
         )
@@ -303,6 +308,7 @@ class Researcher:
         question: str,
         description: str,
         resolution_source: str | None,
+        start_date: str | None,
         end_date: str | None,
         today: str,
     ) -> dict:
@@ -311,6 +317,7 @@ class Researcher:
             "today": today,
             "description": description,
             "resolution_source": resolution_source,
+            "market_start_date": start_date,
             "end_date": end_date,
             "allowed_sources": search_urls,
             "verified_research_memo": memo,
