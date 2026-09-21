@@ -327,23 +327,42 @@ async def load_candidate(client: AsyncPublicClient, s: Settings, ref: str) -> Ca
 
 
 def build_state(c: Candidate, s: Settings, brief: Brief | None = None) -> dict:
-    """Compact state for Jev. Numbers are pre-computed; nothing the question doesn't need.
-    When a research brief is available it goes in as `evidence`."""
+    """Compact Jev state with exact intraday timestamps for short-horizon markets."""
     m = c.market
     desc = (m.description or "").strip()
     if len(desc) > s.description_max_chars:
         desc = desc[: s.description_max_chars].rsplit(" ", 1)[0] + " …"
+
+    now = datetime.now(UTC)
     state: dict = {
         "question": m.question,
         "description": desc,
-        "today": datetime.now(UTC).date().isoformat(),
-        "days_until_resolution": c.days_to_resolution,
+        "as_of_time": now.isoformat(),
         "primary_outcome": str(m.outcomes.yes.label or "Up"),
         "secondary_outcome": str(m.outcomes.no.label or "Down"),
         "timeframe": market_timeframe(m, s),
     }
-    if m.state.start_date:
-        state["market_start_date"] = m.state.start_date.date().isoformat()
+
+    window = market_window(m, s)
+    if window is not None:
+        start, end = window
+        state["market_start_time"] = start.isoformat()
+        state["market_end_time"] = end.isoformat()
+        state["seconds_until_resolution"] = max(0, int((end - now).total_seconds()))
+    else:
+        if m.state.start_date:
+            start = m.state.start_date
+            if start.tzinfo is None:
+                start = start.replace(tzinfo=UTC)
+            state["market_start_time"] = start.astimezone(UTC).isoformat()
+        if m.state.end_date:
+            end = m.state.end_date
+            if end.tzinfo is None:
+                end = end.replace(tzinfo=UTC)
+            end = end.astimezone(UTC)
+            state["market_end_time"] = end.isoformat()
+            state["seconds_until_resolution"] = max(0, int((end - now).total_seconds()))
+
     if m.resolution and m.resolution.source:
         state["resolution_source"] = m.resolution.source
     mid = c.book.midpoint
