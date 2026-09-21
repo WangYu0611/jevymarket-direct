@@ -13,6 +13,7 @@ from jevymarket.market_data import (
     fetch_binance_current,
     fetch_binance_hour_open,
     fetch_binance_recent_history,
+    _source_event_time,
     record_chainlink_anchor_event,
 )
 from jevymarket.store import Store
@@ -200,3 +201,15 @@ def test_price_samples_store_one_value_per_second(tmp_path):
         {"ts": 101, "price": 81002.0},
     ]
     store.close()
+
+
+
+def test_source_event_time_prefers_payload_timestamp():
+    outer = datetime(2026, 9, 21, 5, 0, 6, tzinfo=UTC)
+    payload_ms = int(datetime(2026, 9, 21, 5, 0, 1, tzinfo=UTC).timestamp() * 1000)
+    event = SimpleNamespace(
+        timestamp=outer,
+        payload=SimpleNamespace(timestamp=payload_ms),
+    )
+    observed = _source_event_time(event)
+    assert observed == datetime(2026, 9, 21, 5, 0, 1, tzinfo=UTC)
