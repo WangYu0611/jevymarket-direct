@@ -4,8 +4,9 @@ from __future__ import annotations
 import json
 import math
 
-IO_REVISION = "v6-io-r2"
+IO_REVISION = "v6-io-r3"
 ERROR_REASONS = frozenset({
+    "invalid_book_shape",
     "non_json_stream_frame", "invalid_stream_encoding", "invalid_stream_frame_type",
     "invalid_stream_message_shape", "stream_error_response", "reference_silent",
     "invalid_reference_payload", "twap_message_window_mismatch",
@@ -116,7 +117,10 @@ def data_health(runtime, wall: float, mono: float) -> dict:
             reference_reason = "ready"
         except ValueError as exc:
             reference_reason = error_reason(exc)
-    return {"sources": sources, "anchor_present": anchor is not None, "anchor_price": anchor,
+    books = {t: b.diagnostic(wall, mono, c.max_book_age_seconds) for t, b in cache.books.items()} if cache else {}
+    labels = {market.up_token: "UP", market.down_token: "DOWN"} if market and cache else {}
+    return {"book_details": {labels.get(t, t): info for t, info in books.items()},
+            "book_generation": cache.generation if cache else None, "sources": sources, "anchor_present": anchor is not None, "anchor_price": anchor,
             "fresh_book_sides": fresh_books, "reference_reason": reference_reason,
             "clock_ok": clock_ok, "clock_age_seconds": wall - runtime.clock_ts if runtime.clock_ts else None,
             "clock_sample": runtime.clock_info,
@@ -132,8 +136,14 @@ def health_text(health: dict) -> str:
     twap30, twap60 = (health["sources"][name] for name in ("twap30", "twap60"))
     clock = health["clock_sample"]
     clock_reason = "已核对" if health["clock_ok"] else clock.get("reason", "未核对")
+    names = {"awaiting_snapshot": "待快照", "invalidated": "缓存失效", "ready": "双边就绪",
+             "valid_bid_only": "新鲜/仅买盘", "valid_ask_only": "新鲜/仅卖盘", "valid_empty": "新鲜/空盘",
+             "stale_source": "源时间过期", "stale_receive": "接收时间过期", "future_source": "源时间超前",
+             "receive_clock_invalid": "接收时钟异常", "crossed": "交叉盘口"}
+    detail = "; ".join(f"{label}:{names.get(b['status'], b['status'])}/源{age(b['source_age_seconds'])}"
+                       f"/收{age(b['receive_age_seconds'])}" for label, b in health.get("book_details", {}).items())
     return (f"数据就绪={'是' if health['ready'] else '否'} | raw={raw['samples']}条/{raw['span_seconds']:.0f}s"
             f"/年龄{age(raw['source_age_seconds'])} | TWAP30/60年龄="
             f"{age(twap30['source_age_seconds'])}/{age(twap60['source_age_seconds'])}"
             f" | 目标={'已捕获' if health['anchor_present'] else '待边界'}"
-            f" | 新鲜盘口={health['fresh_book_sides']}/2 | 参考检查={health['reference_reason']} | 时钟={clock_reason}")
+            f" | 新鲜盘口={health['fresh_book_sides']}/2 [{detail}] | 参考检查={health['reference_reason']} | 时钟={clock_reason}")

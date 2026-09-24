@@ -9,6 +9,7 @@ import argparse
 import asyncio
 import json
 import time
+import uuid
 from collections import Counter
 from dataclasses import asdict, replace
 from datetime import datetime, timedelta, timezone
@@ -17,6 +18,7 @@ from pathlib import Path
 
 from .maker_book import BookCache, BookGap, trade_message
 from .maker_config import VERSION, MakerConfig
+from .maker_diagnostics import ReactionWindow, diagnostic_report, safe_book_message
 from .maker_engine import Market, PaperEngine, choose_quote
 from .maker_model import ReferenceCache, finite, source_time, twap_window
 from .maker_protocol import (
@@ -50,6 +52,7 @@ REASONS = {
     "market_unavailable": "等待市场信息",
     "clock_unverified": "服务器时钟未核对或偏差过大，暂停挂单",
     "already_filled": "本市场已有估计成交，不加仓不反手",
+    "observe_only_qualified": "候选满足旧策略条件，但仅观察模式禁止生成模拟挂单",
 }
 
 
@@ -118,16 +121,7 @@ def reference_message(msg: dict, topic: str) -> tuple[float, float] | None:
 
 
 def safe_book_event(msg: dict) -> dict:
-    # Public market events only. Never log HTTP headers, response error bodies,
-    # auth events, .env contents, account identity or arbitrary extra fields.
-    names = ("event_type", "market", "asset_id", "timestamp", "price", "size", "side", "hash",
-             "transaction_hash", "fee_rate_bps", "old_tick_size", "new_tick_size")
-    out = {k: msg[k] for k in names if k in msg and isinstance(msg[k], (str, int, float))}
-    for name in ("bids", "asks", "price_changes"):
-        if isinstance(msg.get(name), list):
-            out[name] = [{k: r[k] for k in ("asset_id", "price", "size", "side", "best_bid", "best_ask", "hash")
-                          if k in r and isinstance(r[k], (str, int, float))} for r in msg[name]]
-    return out
+    return safe_book_message(msg)
 
 
 async def public_json(http, url: str, **params):
@@ -166,6 +160,9 @@ class MakerRuntime:
         self.errors = Counter()
         self.estimate = None
         self.reason = "market_unavailable"
+        self.session_id = uuid.uuid4().hex
+        self.reaction_window = ReactionWindow()
+        self.observe_only = False
 
     def signal(self):
         if self.wake_at is None:
@@ -210,7 +207,7 @@ class MakerRuntime:
                 desired, reason = choose_quote(self.market, self.cache, est, self.c, wall, mono, budget)
             except ValueError as exc:
                 reason = str(exc)  # Only our local enumerated validation errors.
-        safe = desired is not None and not self.engine.halted
+        safe = desired is not None and not self.engine.halted and not self.observe_only
         if active and safe:
             safe = (active.slug == self.market.slug and active.token == desired.token
                     and active.price <= desired.fair_p - self.c.min_edge + 1e-9
@@ -231,6 +228,8 @@ class MakerRuntime:
                 self.engine.submit(self.market, self.cache, desired, wall, mono)
         if self.market and any(o.slug == self.market.slug and o.filled > 0 for o in self.engine.orders):
             reason = "already_filled"
+        if self.observe_only and desired is not None:
+            reason = "observe_only_qualified"
         self.estimate, self.reason = est, reason
 
     async def references(self, name):
@@ -269,6 +268,26 @@ class MakerRuntime:
                 self.error(name, exc)
                 await asyncio.sleep(2)
 
+    def apply_book_message(self, m, cache, msg, wall, mono):
+        try:
+            if msg.get("event_type") == "market_resolved" and msg.get("market") == m.condition:
+                cache.invalidate()
+                raise BookGap("market_closed_verify_official_result")
+            cache.apply(msg, wall, mono)
+            trade = trade_message(msg, m.condition, wall)
+        except (BookGap, ValueError, KeyError, TypeError) as exc:
+            self.store.emit("book_reject", {"io_revision": IO_REVISION, "session_id": self.session_id,
+                "slug": m.slug, "received_ts": wall, "received_mono": mono,
+                "reason": error_reason(exc), "event": safe_book_event(msg),
+                "cache_failure": cache.last_failure if msg.get("event_type") in
+                {"book", "price_change", "tick_size_change"} else None})
+            raise
+        if trade:
+            self.engine.on_trade(trade, wall)
+        if msg.get("event_type") in {"book", "price_change", "tick_size_change", "last_trade_price"}:
+            self.store.emit("book_event", safe_book_event(msg))
+        self.signal()
+
     async def books(self, m: Market, cache: BookCache):
         from websockets.asyncio.client import connect
         while time.time() < m.end:
@@ -285,16 +304,7 @@ class MakerRuntime:
                             raw = await asyncio.wait_for(ws.recv(), 20)
                             for msg in await self.stream_messages(ws, raw, "orderbook"):
                                 wall, mono = time.time(), time.monotonic()
-                                if msg.get("event_type") == "market_resolved" and msg.get("market") == m.condition:
-                                    cache.invalidate()
-                                    raise BookGap("market_closed_verify_official_result")
-                                cache.apply(msg, wall, mono)
-                                trade = trade_message(msg, m.condition, wall)
-                                if trade:
-                                    self.engine.on_trade(trade, wall)
-                                if msg.get("event_type") in {"book", "price_change", "tick_size_change", "last_trade_price"}:
-                                    self.store.emit("book_event", safe_book_event(msg))
-                                self.signal()
+                                self.apply_book_message(m, cache, msg, wall, mono)
                     finally:
                         ping.cancel()
                         await asyncio.gather(ping, return_exceptions=True)
@@ -401,8 +411,9 @@ class MakerRuntime:
             await self.settle_once(http)
             await asyncio.sleep(30)
 
-    async def run(self, seconds=None, settlement_only=False):
+    async def run(self, seconds=None, settlement_only=False, observe_only=False):
         import httpx
+        self.observe_only = bool(observe_only)
         tasks = []
         writer = asyncio.create_task(self.store.writer(), name="maker-writer")
         try:
@@ -416,8 +427,11 @@ class MakerRuntime:
                           asyncio.create_task(self.settlements(http), name="maker-settle")]
                 deadline, started = time.monotonic(), time.monotonic()
                 last_mono, last_wall = started, time.time()
-                self.store.emit("runtime", {"io_revision": IO_REVISION, "strategy_version": VERSION})
+                self.store.emit("runtime", {"io_revision": IO_REVISION, "strategy_version": VERSION, "session_id": self.session_id,
+                                            "observe_only": self.observe_only})
                 print(f"{VERSION} | {IO_REVISION} | 仅模拟post-only | WS实时输入 | 定期评估/记录={self.c.interval_seconds:g}s | 最后{self.c.entry_seconds:g}s至T-{self.c.cancel_before_end_seconds:g}s入场 | 无真实下单", flush=True)
+                if self.observe_only:
+                    print("仅观察模式：不生成新的模拟挂单；旧账本和风险仍保留，不是收益实验", flush=True)
                 while not self.stopped and (seconds is None or time.monotonic() - started < seconds):
                     for task in [*tasks, writer]:
                         if task.done():
@@ -448,10 +462,15 @@ class MakerRuntime:
                                                          "over_budget": elapsed > self.c.reaction_budget_seconds})
                         if elapsed > self.c.reaction_budget_seconds:
                             self.engine.cancel("compute_budget_missed", time.time(), time.monotonic())
+                    measured_ms = (time.monotonic() - (triggered if triggered is not None else mono)) * 1000
+                    self.reaction_window.add(measured_ms, triggered is not None)
                     if mono >= deadline:
+                        self.store.emit("reaction_window", dict(self.reaction_window.take(),
+                                                               io_revision=IO_REVISION, session_id=self.session_id))
                         health = data_health(self, wall, mono)
                         self.store.emit("observation", {"ts": wall, "slug": self.market.slug if self.market else None,
-                            "io_revision": IO_REVISION, "data_health": health, "stream_controls": dict(self.stream_controls),
+                            "io_revision": IO_REVISION, "session_id": self.session_id, "observe_only": self.observe_only,
+                            "data_health": health, "stream_controls": dict(self.stream_controls),
                             "reason": self.reason, "estimate": asdict(self.estimate) if self.estimate else None,
                             "book": {t: {"bid": b.bid, "ask": b.ask, "source_ts": b.ts, "tick": b.tick, "minimum": b.minimum}
                                      for t, b in self.cache.books.items()} if self.cache else None,
@@ -472,6 +491,9 @@ class MakerRuntime:
                 if task:
                     task.cancel()
             await asyncio.gather(*(t for t in [*tasks, self.book_task] if t), return_exceptions=True)
+            if not self.store.failed:
+                self.store.emit("reaction_window", dict(self.reaction_window.take(),
+                                                       io_revision=IO_REVISION, session_id=self.session_id))
             self.store.stopping = True
             await asyncio.wait_for(writer, 10)
 
@@ -483,13 +505,23 @@ def main():
     run.add_argument("--dry-run", action="store_true", required=True)
     run.add_argument("--loop", type=float, default=2.0)
     run.add_argument("--seconds", type=float)
+    run.add_argument("--observe-only", action="store_true", help="只观察和诊断，不生成新的模拟挂单")
     for p in (run, commands.add_parser("settle")):
         p.add_argument("--db", type=Path, default=DEFAULT_DB)
         p.add_argument("--config", type=Path)
     stats = commands.add_parser("stats")
     stats.add_argument("--db", type=Path, default=DEFAULT_DB)
     stats.add_argument("--out", type=Path)
+    diagnose = commands.add_parser("diagnose", help="只读导出最近一次运行的小型盘口诊断，不复制全部行情")
+    diagnose.add_argument("--db", type=Path, default=DEFAULT_DB)
+    diagnose.add_argument("--out", type=Path)
     args = parser.parse_args()
+    if args.command == "diagnose":
+        report = diagnostic_report(args.db, args.out)
+        print(json.dumps(report["summary"], ensure_ascii=False, indent=2))
+        if args.out:
+            print(f"已导出小型盘口诊断 → {args.out}")
+        return
     if args.command == "stats":
         print(json.dumps(statistics(args.db, args.out), ensure_ascii=False, indent=2))
         return
@@ -503,7 +535,8 @@ def main():
         store = MakerStore(args.db, config)
         runtime = MakerRuntime(config, store)
         try:
-            asyncio.run(runtime.run(getattr(args, "seconds", None), args.command == "settle"))
+            asyncio.run(runtime.run(getattr(args, "seconds", None), args.command == "settle",
+                                    getattr(args, "observe_only", False)))
         except KeyboardInterrupt:
             print("已停止；保留所有研究记录。使用maker settle回填官方结算。")
 
