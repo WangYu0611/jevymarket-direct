@@ -6,12 +6,13 @@ from .maker_model import finite, source_time
 
 
 class SnapshotBookCache(BookCache):
-    """Fence startup deltas strictly older than ALL affected fresh snapshots.
+    """Fence covered startup deltas without changing any cached state.
 
     The base validator remains strict. The exception here is a read-only discard
     before any post-snapshot delta has been accepted for the affected tokens.
-    Equal timestamps, mixed old/new token rows, malformed data, and regressions
-    after an accepted delta still go through the original validator.
+    A mixed old/equal event is discarded only when every equal-time row is an
+    exact depth/BBO no-op. Equal-only events, changed equal-time rows, newer rows,
+    malformed data and regressions after an accepted delta keep the strict path.
     """
 
     def __init__(self, condition, specs):
@@ -39,7 +40,8 @@ class SnapshotBookCache(BookCache):
             ts = source_time(msg.get("timestamp"))
             if not 0 <= wall - ts <= 5:
                 return None
-            snapshots = {}
+            snapshots, equal_noop_tokens = {}, set()
+            strictly_older = False
             for row in rows:
                 if not isinstance(row, dict):
                     return None
@@ -48,22 +50,36 @@ class SnapshotBookCache(BookCache):
                 baseline = self.snapshot_baselines.get(token)
                 if book is None or baseline is None or not book.ready:
                     return None
-                if (book.ts, book.received_mono) != baseline or not ts < baseline[0]:
+                if (book.ts, book.received_mono) != baseline or ts > baseline[0]:
                     return None
                 if not (0 <= wall - book.ts <= 5 and 0 <= mono - book.received_mono <= 5):
                     return None
                 if row.get("side") not in {"BUY", "SELL"}:
                     return None
-                self._level(row["price"], row["size"])
+                price, size = self._level(row["price"], row["size"])
                 for label in ("best_bid", "best_ask"):
                     if label in row and not 0 <= finite(row[label]) <= 1:
                         return None
+                if ts == baseline[0]:
+                    # Equality is not evidence of coverage. Only a literal no-op
+                    # may accompany older rows; never rewind changed quantities.
+                    levels = book.bids if row["side"] == "BUY" else book.asks
+                    if (levels.get(price, 0.0) != size or book.bid is None or book.ask is None
+                            or finite(row.get("best_bid")) != book.bid
+                            or finite(row.get("best_ask")) != book.ask):
+                        return None
+                    equal_noop_tokens.add(token)
+                else:
+                    strictly_older = True
                 snapshots[token] = baseline[0]
+            if not strictly_older:
+                return None  # All-equal messages retain original apply semantics.
         except (KeyError, TypeError, ValueError):
             # Malformed messages must reach the strict validator, not disappear.
             return None
         return {"reason": "pre_snapshot_delta_discarded", "source_ts": ts,
-                "snapshot_source_ts": snapshots, "rows": len(rows)}
+                "snapshot_source_ts": snapshots, "rows": len(rows),
+                "equal_noop_tokens": sorted(equal_noop_tokens)}
 
     def apply(self, msg, wall, mono):
         self.last_discard = None
