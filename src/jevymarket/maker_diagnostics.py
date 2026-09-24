@@ -82,7 +82,7 @@ def safe_book_message(msg: dict) -> dict:
     def scalar(value):
         if isinstance(value, str):
             if len(value) > 512:
-                changes = True
+                changed.append("long_string")
             return value[:512]
         if type(value) in (int, float) and math.isfinite(value):
             return value
