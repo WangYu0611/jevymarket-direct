@@ -16,10 +16,11 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 
-from .maker_book import BookCache, BookGap, trade_message
+from .maker_book import BookGap, trade_message
 from .maker_config import VERSION, MakerConfig
 from .maker_diagnostics import ReactionWindow, diagnostic_report, safe_book_message
 from .maker_engine import Market, PaperEngine, choose_quote
+from .maker_ingress import SnapshotBookCache as BookCache
 from .maker_model import ReferenceCache, finite, source_time, twap_window
 from .maker_protocol import (
     IO_REVISION,
@@ -91,7 +92,7 @@ def official_winner(data: dict, slug: str, condition: str, now: float) -> str | 
         return None
     if now < int(slug.rsplit("-", 1)[1]) + 300:
         return None
-    labels, prices = array(data.get("outcomes")), array(data.get("outcomePrices"))
+    labels, prices = array(data["outcomes"]), array(data["outcomePrices"])
     if len(labels) != 2 or len(prices) != 2 or {str(x).upper() for x in labels} != {"UP", "DOWN"}:
         return None
     mapped = {str(k).upper(): Decimal(str(v)) for k, v in zip(labels, prices, strict=True)}
@@ -274,6 +275,12 @@ class MakerRuntime:
                 cache.invalidate()
                 raise BookGap("market_closed_verify_official_result")
             cache.apply(msg, wall, mono)
+            discarded = getattr(cache, "last_discard", None)
+            if discarded is not None:
+                self.store.emit("book_discard", {"io_revision": IO_REVISION, "session_id": self.session_id,
+                    "slug": m.slug, "received_ts": wall, "received_mono": mono,
+                    **discarded, "event": safe_book_event(msg)})
+                return  # Not an applied book_event, fresh quote, or fill.
             trade = trade_message(msg, m.condition, wall)
         except (BookGap, ValueError, KeyError, TypeError) as exc:
             self.store.emit("book_reject", {"io_revision": IO_REVISION, "session_id": self.session_id,
@@ -288,16 +295,28 @@ class MakerRuntime:
             self.store.emit("book_event", safe_book_event(msg))
         self.signal()
 
+    def protect_book_failure(self, m, cache):
+        """Local risk action BEFORE heartbeat cleanup or websocket close awaits."""
+        cache.invalidate()
+        self.engine.cancel("book_disconnected", time.time(), time.monotonic())
+        active = self.engine.active()
+        if active and active.slug == m.slug and active.active_ts is not None and not active.uncertain:
+            active.uncertain, self.engine.halted = True, True
+            self.engine.changed(active, "book_disconnect_unknown_fills")
+        self.signal()
+
     async def books(self, m: Market, cache: BookCache):
         from websockets.asyncio.client import connect
         while time.time() < m.end:
+            protected = False
             try:
                 cache.invalidate()
                 async with connect(MARKET_WS, open_timeout=10, close_timeout=2, ping_interval=None,
                                    max_size=2 ** 20, max_queue=16) as ws:
-                    await ws.send(encode({"assets_ids": list(cache.books), "type": "market", "custom_feature_enabled": True}))
-                    ping = asyncio.create_task(heartbeat(ws, 10))
+                    ping = None
                     try:
+                        await ws.send(encode({"assets_ids": list(cache.books), "type": "market", "custom_feature_enabled": True}))
+                        ping = asyncio.create_task(heartbeat(ws, 10))
                         while time.time() < m.end:
                             if ping.done():
                                 ping.result()
@@ -305,19 +324,25 @@ class MakerRuntime:
                             for msg in await self.stream_messages(ws, raw, "orderbook"):
                                 wall, mono = time.time(), time.monotonic()
                                 self.apply_book_message(m, cache, msg, wall, mono)
+                    except Exception:
+                        # Do not leave this to the outer handler: __aexit__ can
+                        # await the close handshake before that handler runs.
+                        self.protect_book_failure(m, cache)
+                        protected = True
+                        raise
                     finally:
-                        ping.cancel()
-                        await asyncio.gather(ping, return_exceptions=True)
+                        cache.invalidate()
+                        self.engine.cancel("book_disconnect_or_roll", time.time(), time.monotonic())
+                        self.signal()
+                        if ping:
+                            ping.cancel()
+                            await asyncio.gather(ping, return_exceptions=True)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                cache.invalidate()
-                self.engine.cancel("book_disconnected", time.time(), time.monotonic())
+                if not protected:
+                    self.protect_book_failure(m, cache)
                 self.error("orderbook", exc)
-                active = self.engine.active()
-                if active and active.slug == m.slug and active.active_ts is not None:
-                    active.uncertain, self.engine.halted = True, True
-                    self.engine.changed(active, "book_disconnect_unknown_fills")
                 await asyncio.sleep(1)
             finally:
                 cache.invalidate()
