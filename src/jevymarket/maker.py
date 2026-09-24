@@ -92,7 +92,7 @@ def official_winner(data: dict, slug: str, condition: str, now: float) -> str | 
         return None
     if now < int(slug.rsplit("-", 1)[1]) + 300:
         return None
-    labels, prices = array(data["outcomes"]), array(data["outcomePrices"])
+    labels, prices = array(data.get("outcomes")), array(data.get("outcomePrices"))
     if len(labels) != 2 or len(prices) != 2 or {str(x).upper() for x in labels} != {"UP", "DOWN"}:
         return None
     mapped = {str(k).upper(): Decimal(str(v)) for k, v in zip(labels, prices, strict=True)}
