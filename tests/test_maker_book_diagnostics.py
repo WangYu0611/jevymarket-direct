@@ -14,7 +14,7 @@ from jevymarket.maker_diagnostics import (
     merge_reactions,
     safe_book_message,
 )
-from jevymarket.maker_protocol import error_reason
+from jevymarket.maker_protocol import IO_REVISION, error_reason
 
 NOW = 1_800_000_291.0
 SPECS = {"11": (.01, 5), "22": (.01, 5)}
@@ -272,7 +272,7 @@ def test_runtime_records_rejected_message_before_outer_reconnect_clears_cache():
         rt.apply_book_message(m, c, bad_delta(), NOW+.2, 100.2)
     assert len(emitted) == 1
     kind, d = emitted[0]
-    assert kind == "book_reject" and d["io_revision"] == "v6-io-r3"
+    assert kind == "book_reject" and d["io_revision"] == IO_REVISION
     assert d["event"] == bad_delta() and d["reason"] == "bbo_delta_mismatch"
     assert d["cache_failure"]["before"]["books"]["11"]["bids"] == [[.4, 10]]
     assert rt.engine.orders == []
