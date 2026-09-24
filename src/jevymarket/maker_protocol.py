@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 import math
 
-IO_REVISION = "v6-io-r3"
+IO_REVISION = "v6-io-r4"
 ERROR_REASONS = frozenset({
     "invalid_book_shape",
     "non_json_stream_frame", "invalid_stream_encoding", "invalid_stream_frame_type",
