@@ -8,6 +8,8 @@ import sqlite3
 from collections import Counter, deque
 from pathlib import Path
 
+from .maker_resync import resync_summary
+
 
 class ReactionWindow:
     """All coalesced signal evaluations, including when no order exists.
@@ -180,6 +182,7 @@ def diagnostic_report(path: Path, out: Path | None = None) -> dict:
         # The reporting scope is explicitly the latest runtime marker, not all
         # old failures accumulated in the database. Orders remain cumulative.
         summary = {"paper_only": True, "runtime": runtime, "start_event_id": start_id, "start_ts": start_ts,
+                   "resync_latest_run": resync_summary(conn, start_id),
                    "event_counts_latest_run": counts, "source_errors_latest_run": dict(errors),
                    "book_rejections_latest_run": dict(rejects), "observation_reasons_latest_run": dict(reasons),
                    "token_book_status_counts": dict(statuses), "token_book_shape_counts": dict(shapes),
