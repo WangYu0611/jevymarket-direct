@@ -19,6 +19,15 @@ from .maker_book import BookCache, BookGap, trade_message
 from .maker_config import VERSION, MakerConfig
 from .maker_engine import Market, PaperEngine, choose_quote
 from .maker_model import ReferenceCache, finite, source_time, twap_window
+from .maker_protocol import (
+    IO_REVISION,
+    clock_retry_seconds,
+    clock_sample,
+    data_health,
+    decode_stream_frame,
+    error_reason,
+    health_text,
+)
 from .maker_store import MakerStore, encode, single_process, statistics
 
 GAMMA = "https://gamma-api.polymarket.com"
@@ -94,6 +103,8 @@ def reference_message(msg: dict, topic: str) -> tuple[float, float] | None:
     if msg.get("topic") != topic or msg.get("type") != "update":
         return None
     payload = msg.get("payload", {})
+    if not isinstance(payload, dict):
+        raise ValueError("invalid_reference_payload")
     if payload.get("symbol") != "btc/usd":
         return None
     ts = source_time(payload.get("timestamp"))  # Never use envelope/receive time.
@@ -123,7 +134,8 @@ async def public_json(http, url: str, **params):
     # Read-only endpoint allowlist. No orders/cancellation/signing transport exists.
     if not (url.startswith(GAMMA + "/markets/slug/") or url in {CLOB + "/book", CLOB + "/time"}):
         raise ValueError("non_public_read_endpoint")
-    result = await http.get(url, params=params, timeout=4)
+    options = {"headers": {"Cache-Control": "no-cache", "Pragma": "no-cache"}} if url == CLOB + "/time" else {}
+    result = await http.get(url, params=params, timeout=4, **options)
     result.raise_for_status()
     return result.json()
 
@@ -148,6 +160,8 @@ class MakerRuntime:
         self.metadata_ts = 0.0
         self.clock_ts = 0.0
         self.clock_ok = False
+        self.clock_info = {}
+        self.stream_controls = Counter()
         self.stopped = False
         self.errors = Counter()
         self.estimate = None
@@ -160,11 +174,21 @@ class MakerRuntime:
 
     def error(self, stage, exc):
         code = type(exc).__name__
-        self.errors[(stage, code)] += 1
-        if self.errors[(stage, code)] == 1 or self.errors[(stage, code)] % 30 == 0:
-            print(f"[{stage}] 公共数据暂不可用：{code}；不使用过期价格，不记录虚构成交", flush=True)
-        self.store.emit("source_error", {"stage": stage, "code": code})
+        detail = error_reason(exc)
+        key = (stage, code, detail)
+        self.errors[key] += 1
+        if self.errors[key] == 1 or self.errors[key] % 30 == 0:
+            print(f"[{stage}] 公共数据暂不可用：{code}/{detail}；不使用过期价格，不记录虚构成交", flush=True)
+        self.store.emit("source_error", {"stage": stage, "code": code, "reason": detail, "io_revision": IO_REVISION})
         self.signal()
+
+    async def stream_messages(self, ws, raw, name):
+        messages, control, reply = decode_stream_frame(raw)
+        if control:
+            self.stream_controls[f"{name}:{control}"] += 1
+        if reply is not None:
+            await asyncio.wait_for(ws.send(reply), 2)
+        return messages
 
     def react(self, wall=None, mono=None):
         wall = time.time() if wall is None else wall
@@ -226,20 +250,12 @@ class MakerRuntime:
                             if ping.done():
                                 ping.result()
                             raw = await asyncio.wait_for(ws.recv(), max(.01, 20 - (time.monotonic() - last_valid)))
-                            if raw in {"PING", "PONG"}:
-                                if raw == "PING":
-                                    await ws.send("PONG")
-                                if time.monotonic() - last_valid > 20:
-                                    raise TimeoutError("reference_silent")
-                                continue
-                            msg = json.loads(raw)
-                            if not isinstance(msg, dict):
-                                continue
-                            quote = reference_message(msg, topic)
-                            if quote and self.reference.add(name, *quote, time.time()):
-                                last_valid = time.monotonic()
-                                self.store.emit("reference", {"name": name, "source_ts": quote[0], "price": quote[1]})
-                                self.signal()
+                            for msg in await self.stream_messages(ws, raw, name):
+                                quote = reference_message(msg, topic)
+                                if quote and self.reference.add(name, *quote, time.time()):
+                                    last_valid = time.monotonic()
+                                    self.store.emit("reference", {"name": name, "source_ts": quote[0], "price": quote[1]})
+                                    self.signal()
                             if time.monotonic() - last_valid > 20:
                                 raise TimeoutError("reference_silent")
                     finally:
@@ -267,14 +283,7 @@ class MakerRuntime:
                             if ping.done():
                                 ping.result()
                             raw = await asyncio.wait_for(ws.recv(), 20)
-                            if raw in {"PING", "PONG"}:
-                                if raw == "PING":
-                                    await ws.send("PONG")
-                                continue
-                            data = json.loads(raw)
-                            for msg in data if isinstance(data, list) else [data]:
-                                if not isinstance(msg, dict):
-                                    continue
+                            for msg in await self.stream_messages(ws, raw, "orderbook"):
                                 wall, mono = time.time(), time.monotonic()
                                 if msg.get("event_type") == "market_resolved" and msg.get("market") == m.condition:
                                     cache.invalidate()
@@ -340,25 +349,36 @@ class MakerRuntime:
                 self.error("metadata", exc)
             await asyncio.sleep(2 if self.market is None or time.time() >= self.market.end else 15)
 
+    async def clock_once(self, http):
+        before, started = time.time(), time.monotonic()
+        try:
+            stamp = source_time(await public_json(http, CLOB + "/time"))
+            after, rtt = time.time(), time.monotonic() - started
+            sample = clock_sample(stamp, before, after, rtt)
+            previously_ok = self.clock_ok
+            self.clock_info = sample
+            self.clock_ok, self.clock_ts = sample["acceptable"], after
+            self.store.emit("clock", dict(sample, io_revision=IO_REVISION))
+            if not self.clock_ok or not previously_ok:
+                print(f"[server_clock] {'校验通过' if self.clock_ok else '暂停报价'}：{sample['reason']}"
+                      f" | RTT={rtt:.3f}s | 偏差区间=[{sample['offset_lower_seconds']:+.3f},"
+                      f"{sample['offset_upper_seconds']:+.3f}]s（秒级精度，非NTP）", flush=True)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self.clock_ok = False
+            self.clock_info = {"acceptable": False, "reason": "clock_request_failed"}
+            self.error("server_clock", exc)
+        self.signal()
+        return self.clock_ok
+
     async def clock(self, http):
+        failures = 0
         while True:
-            try:
-                before = time.time()
-                stamp = source_time(await public_json(http, CLOB + "/time"))
-                after = time.time()
-                # Server time is whole seconds: allow quantisation but require a
-                # short RTT. Record the uncertainty; do not rewrite source times.
-                ok = after - before < 1 and before - 1.5 <= stamp <= after + .5
-                self.clock_ok, self.clock_ts = ok, after
-                self.store.emit("clock", {"rtt_seconds": after - before, "offset_seconds": stamp - (before + after) / 2,
-                                          "whole_second_clock": True, "acceptable": ok})
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                self.clock_ok = False
-                self.error("server_clock", exc)
-            self.signal()
-            await asyncio.sleep(30)
+            failures = 0 if await self.clock_once(http) else failures + 1
+            # Bad samples still immediately block quoting. Retry sooner, do not
+            # widen the RTT/offset guard or reuse a failed/stale clock sample.
+            await asyncio.sleep(clock_retry_seconds(failures))
 
     async def settle_once(self, http):
         pending = {}
@@ -396,7 +416,8 @@ class MakerRuntime:
                           asyncio.create_task(self.settlements(http), name="maker-settle")]
                 deadline, started = time.monotonic(), time.monotonic()
                 last_mono, last_wall = started, time.time()
-                print(f"{VERSION} | 仅模拟post-only | WS实时输入 | 定期评估/记录={self.c.interval_seconds:g}s | 最后{self.c.entry_seconds:g}s至T-{self.c.cancel_before_end_seconds:g}s入场 | 无真实下单", flush=True)
+                self.store.emit("runtime", {"io_revision": IO_REVISION, "strategy_version": VERSION})
+                print(f"{VERSION} | {IO_REVISION} | 仅模拟post-only | WS实时输入 | 定期评估/记录={self.c.interval_seconds:g}s | 最后{self.c.entry_seconds:g}s至T-{self.c.cancel_before_end_seconds:g}s入场 | 无真实下单", flush=True)
                 while not self.stopped and (seconds is None or time.monotonic() - started < seconds):
                     for task in [*tasks, writer]:
                         if task.done():
@@ -428,14 +449,17 @@ class MakerRuntime:
                         if elapsed > self.c.reaction_budget_seconds:
                             self.engine.cancel("compute_budget_missed", time.time(), time.monotonic())
                     if mono >= deadline:
+                        health = data_health(self, wall, mono)
                         self.store.emit("observation", {"ts": wall, "slug": self.market.slug if self.market else None,
+                            "io_revision": IO_REVISION, "data_health": health, "stream_controls": dict(self.stream_controls),
                             "reason": self.reason, "estimate": asdict(self.estimate) if self.estimate else None,
                             "book": {t: {"bid": b.bid, "ask": b.ask, "source_ts": b.ts, "tick": b.tick, "minimum": b.minimum}
                                      for t, b in self.cache.books.items()} if self.cache else None,
                             "risk_reserved_usd": self.engine.exposure(), "halted": self.engine.halted})
                         view = self.engine.report()
                         ts = datetime.fromtimestamp(wall, timezone(timedelta(hours=8))).strftime("%m-%d %H:%M:%S")
-                        print(f"[{ts}] {REASONS.get(self.reason, self.reason)} | 报价{view['quotes']} 估计成交{view['filled_orders_estimated']} | 毛PnL估计 ${view['gross_pnl_estimated']:+.2f} | 风险占用 ${view['open_risk_reserved_usd']:.2f} | 风险暂停={self.engine.halted}", flush=True)
+                        print(f"[{ts}] {REASONS.get(self.reason, self.reason)} | 报价{view['quotes']} 估计成交{view['filled_orders_estimated']} | 毛PnL估计 ${view['gross_pnl_estimated']:+.2f} | 风险占用 ${view['open_risk_reserved_usd']:.2f} | 账本风险暂停={self.engine.halted}", flush=True)
+                        print("  " + health_text(health), flush=True)
                         deadline += (int(max(0, mono - deadline) / self.c.interval_seconds) + 1) * self.c.interval_seconds
         finally:
             if self.store.failed:
