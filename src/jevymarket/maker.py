@@ -31,6 +31,7 @@ from .maker_protocol import (
     error_reason,
     health_text,
 )
+from .maker_resync import read_resync_books
 from .maker_store import MakerStore, encode, single_process, statistics
 
 GAMMA = "https://gamma-api.polymarket.com"
@@ -317,13 +318,7 @@ class MakerRuntime:
                     try:
                         await ws.send(encode({"assets_ids": list(cache.books), "type": "market", "custom_feature_enabled": True}))
                         ping = asyncio.create_task(heartbeat(ws, 10))
-                        while time.time() < m.end:
-                            if ping.done():
-                                ping.result()
-                            raw = await asyncio.wait_for(ws.recv(), 20)
-                            for msg in await self.stream_messages(ws, raw, "orderbook"):
-                                wall, mono = time.time(), time.monotonic()
-                                self.apply_book_message(m, cache, msg, wall, mono)
+                        await read_resync_books(self, m, cache, ws, ping, safe_book_event, IO_REVISION)
                     except Exception:
                         # Do not leave this to the outer handler: __aexit__ can
                         # await the close handshake before that handler runs.
