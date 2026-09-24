@@ -136,8 +136,9 @@ def runtime_fixture():
 
 
 def test_integration_reference_stream_empty_and_heartbeats_preserve_history(monkeypatch):
-    import jevymarket.maker as maker
     import websockets.asyncio.client as client
+
+    import jevymarket.maker as maker
     runtime, emitted = runtime_fixture()
     now = time.time()
     runtime.reference.add("raw", now - 1, 100, now)
@@ -154,8 +155,9 @@ def test_integration_reference_stream_empty_and_heartbeats_preserve_history(monk
 
 
 def test_integration_heartbeats_do_not_refresh_valid_quote_deadline(monkeypatch):
-    import jevymarket.maker as maker
     import websockets.asyncio.client as client
+
+    import jevymarket.maker as maker
     runtime, _ = runtime_fixture()
     clock = [0.0]
     ws = FakeSocket(["PONG"])
@@ -177,8 +179,8 @@ def test_integration_heartbeats_do_not_refresh_valid_quote_deadline(monkeypatch)
 
 
 def test_integration_orderbook_controls_do_not_drop_snapshots(monkeypatch):
-    import jevymarket.maker as maker
     import websockets.asyncio.client as client
+
     from jevymarket.maker_book import BookCache
     from jevymarket.maker_engine import Market
     runtime, emitted = runtime_fixture()
