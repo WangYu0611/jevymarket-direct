@@ -206,11 +206,12 @@ def test_integration_clock_failure_does_not_reuse_previous_pass(monkeypatch):
     async def timestamp(*args, **kwargs):
         return 1010
     monkeypatch.setattr(maker, "public_json", timestamp)
-    walls, monos = iter([1000, 1000.2]), iter([10, 10.2, 10.3])
-    monkeypatch.setattr(maker, "time", SimpleNamespace(time=lambda: next(walls), monotonic=lambda: next(monos)))
+    walls, nanos = iter([1000, 1000.2]), iter([10_000_000_000, 10_200_000_000, 10_300_000_000])
+    monkeypatch.setattr(maker, "time", SimpleNamespace(time=lambda: next(walls), perf_counter_ns=lambda: next(nanos)))
     assert not asyncio.run(runtime.clock_once(None))
     assert not runtime.clock_ok
     assert emitted[-1][1]["reason"] == "clock_offset_exceeded"
+    assert runtime.clock_info["rtt_seconds"] == .2
 
 
 def test_integration_time_read_bypasses_caches_without_changing_price_reads():
