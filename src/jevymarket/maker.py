@@ -22,6 +22,7 @@ from .maker_diagnostics import ReactionWindow, diagnostic_report, safe_book_mess
 from .maker_engine import Market, PaperEngine, choose_quote
 from .maker_ingress import SnapshotBookCache as BookCache
 from .maker_model import ReferenceCache, finite, source_time, twap_window
+from .maker_precision import HTTP_STAGES, clock_receipt, run_reaction
 from .maker_protocol import (
     IO_REVISION,
     clock_retry_seconds,
@@ -152,7 +153,7 @@ class MakerRuntime:
         self.cache = None
         self.book_task = None
         self.wake = asyncio.Event()
-        self.wake_at = None
+        self.wake_at_ns = None
         self.metadata_ts = 0.0
         self.clock_ts = 0.0
         self.clock_ok = False
@@ -167,8 +168,8 @@ class MakerRuntime:
         self.observe_only = False
 
     def signal(self):
-        if self.wake_at is None:
-            self.wake_at = time.monotonic()
+        if self.wake_at_ns is None:
+            self.wake_at_ns = time.perf_counter_ns()
         self.wake.set()
 
     def error(self, stage, exc):
@@ -178,7 +179,12 @@ class MakerRuntime:
         self.errors[key] += 1
         if self.errors[key] == 1 or self.errors[key] % 30 == 0:
             print(f"[{stage}] 公共数据暂不可用：{code}/{detail}；不使用过期价格，不记录虚构成交", flush=True)
-        self.store.emit("source_error", {"stage": stage, "code": code, "reason": detail, "io_revision": IO_REVISION})
+        data = {"stage": stage, "code": code, "reason": detail, "io_revision": IO_REVISION,
+                "session_id": self.session_id}
+        if stage in HTTP_STAGES:
+            from .maker_transport_probe import safe_error
+            data["transport_detail"] = safe_error(exc)
+        self.store.emit("source_error", data)
         self.signal()
 
     async def stream_messages(self, ws, raw, name):
@@ -380,10 +386,10 @@ class MakerRuntime:
             await asyncio.sleep(2 if self.market is None or time.time() >= self.market.end else 15)
 
     async def clock_once(self, http):
-        before, started = time.time(), time.monotonic()
+        before, started_ns = time.time(), time.perf_counter_ns()
         try:
             stamp = source_time(await public_json(http, CLOB + "/time"))
-            after, rtt = time.time(), time.monotonic() - started
+            after, rtt = time.time(), (time.perf_counter_ns() - started_ns) / 1e9
             sample = clock_sample(stamp, before, after, rtt)
             previously_ok = self.clock_ok
             self.clock_info = sample
@@ -448,8 +454,9 @@ class MakerRuntime:
                 deadline, started = time.monotonic(), time.monotonic()
                 last_mono, last_wall = started, time.time()
                 self.store.emit("runtime", {"io_revision": IO_REVISION, "strategy_version": VERSION, "session_id": self.session_id,
-                                            "observe_only": self.observe_only})
+                                            "observe_only": self.observe_only, "measurement": clock_receipt()})
                 print(f"{VERSION} | {IO_REVISION} | 仅模拟post-only | WS实时输入 | 定期评估/记录={self.c.interval_seconds:g}s | 最后{self.c.entry_seconds:g}s至T-{self.c.cancel_before_end_seconds:g}s入场 | 无真实下单", flush=True)
+                print("本地反应计时：" + clock_receipt()["revision"] + " / perf_counter_ns；不是交易所回执", flush=True)
                 if self.observe_only:
                     print("仅观察模式：不生成新的模拟挂单；旧账本和风险仍保留，不是收益实验", flush=True)
                 while not self.stopped and (seconds is None or time.monotonic() - started < seconds):
@@ -467,23 +474,7 @@ class MakerRuntime:
                         self.clock_ok = False
                         self.engine.cancel("wall_clock_jump", wall, mono)
                     last_wall, last_mono = wall, mono
-                    triggered = self.wake_at
-                    self.wake_at = None
-                    # A scheduler stall is a risk event, not a fast reaction.
-                    lag = 0 if triggered is None else mono - triggered
-                    if lag > self.c.reaction_budget_seconds:
-                        self.engine.cancel("reaction_budget_missed", wall, mono)
-                        self.store.emit("reaction", {"elapsed_ms": lag * 1000, "over_budget": True})
-                    else:
-                        self.react(wall, mono)
-                        elapsed = time.monotonic() - (triggered if triggered is not None else mono)
-                        if triggered is not None and self.engine.active():
-                            self.store.emit("reaction", {"elapsed_ms": elapsed * 1000,
-                                                         "over_budget": elapsed > self.c.reaction_budget_seconds})
-                        if elapsed > self.c.reaction_budget_seconds:
-                            self.engine.cancel("compute_budget_missed", time.time(), time.monotonic())
-                    measured_ms = (time.monotonic() - (triggered if triggered is not None else mono)) * 1000
-                    self.reaction_window.add(measured_ms, triggered is not None)
+                    run_reaction(self, wall, mono, clock=time)
                     if mono >= deadline:
                         self.store.emit("reaction_window", dict(self.reaction_window.take(),
                                                                io_revision=IO_REVISION, session_id=self.session_id))

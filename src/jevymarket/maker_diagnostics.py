@@ -8,6 +8,7 @@ import sqlite3
 from collections import Counter, deque
 from pathlib import Path
 
+from .maker_precision import TransportFailures
 from .maker_resync import resync_summary
 
 
@@ -140,6 +141,7 @@ def diagnostic_report(path: Path, out: Path | None = None) -> dict:
         errors, rejects, reasons, statuses, shapes, clocks = (Counter() for _ in range(6))
         reaction_windows, examples, last_observation = [], [], None
         example_counts, example_bytes, omitted = Counter(), 0, 0
+        transport = TransportFailures()
         late = deque(maxlen=24)
         for event_id, ts, kind, data in conn.execute(
             "SELECT id,ts,kind,data FROM maker_events WHERE id>=? AND kind IN "
@@ -147,6 +149,7 @@ def diagnostic_report(path: Path, out: Path | None = None) -> dict:
         ):
             d = json.loads(data)
             if kind == "source_error":
+                transport.add(d)
                 errors["|".join(str(d.get(k, "unknown")) for k in ("stage", "code", "reason"))] += 1
             elif kind == "book_reject":
                 reason = d.get("reason", "unknown")
@@ -183,6 +186,8 @@ def diagnostic_report(path: Path, out: Path | None = None) -> dict:
         # old failures accumulated in the database. Orders remain cumulative.
         summary = {"paper_only": True, "runtime": runtime, "start_event_id": start_id, "start_ts": start_ts,
                    "resync_latest_run": resync_summary(conn, start_id),
+                   "measurement_latest_run": runtime.get("measurement", {"clock": "legacy_or_unrecorded", "resolution_seconds": None}),
+                   "http_failures_latest_run": transport.report(),
                    "event_counts_latest_run": counts, "source_errors_latest_run": dict(errors),
                    "book_rejections_latest_run": dict(rejects), "observation_reasons_latest_run": dict(reasons),
                    "token_book_status_counts": dict(statuses), "token_book_shape_counts": dict(shapes),
