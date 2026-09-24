@@ -4,7 +4,6 @@ import gzip
 import hashlib
 import inspect
 import json
-import time
 from copy import deepcopy
 from types import SimpleNamespace
 
@@ -17,6 +16,54 @@ from jevymarket.maker_bbo_evidence import BBOEvidence, encode, inspect_frame
 NOW = 1_800_000_000.0
 MONO = 1_000_000_000_000
 SPECS = {"11": (.01, 5), "22": (.01, 5)}
+
+
+@pytest.fixture
+def collector_clock(monkeypatch):
+    """Control collector retries, not pytest/asyncio's process-global clocks.
+
+    These orchestration tests mock discovery/read_connection. Immediate wait_for
+    models that completed I/O; the real reader has its own transport test below.
+    """
+    class Clock:
+        elapsed_ns = 0
+        early_first_wake = False
+
+        def __init__(self):
+            self.sleeps = []
+
+        def advance(self, seconds):
+            self.elapsed_ns += round(seconds * 1e9)
+
+        def monotonic(self):
+            return self.elapsed_ns / 1e9
+
+        def time(self):
+            return NOW + self.monotonic()
+
+        def perf_counter_ns(self):
+            return MONO + self.elapsed_ns
+
+        async def sleep(self, delay):
+            # Reproduce an early timer wake explicitly rather than relying on OS
+            # resolution. Only the first wake is early; the next reaches expiry.
+            elapsed = round(delay * 1e9)
+            if self.early_first_wake and not self.sleeps:
+                elapsed = max(0, elapsed - 1_000_000)
+            self.sleeps.append(delay)
+            self.elapsed_ns += elapsed
+            await asyncio.sleep(0)
+
+    async def immediate(awaitable, timeout):
+        assert timeout > 0
+        return await awaitable
+
+    clock = Clock()
+    # Replace only the probe's module references, not shared stdlib attributes.
+    monkeypatch.setattr(probe, "time", clock)
+    monkeypatch.setattr(probe, "asyncio", SimpleNamespace(
+        wait_for=immediate, sleep=clock.sleep, CancelledError=asyncio.CancelledError))
+    return clock
 
 
 def book(token="11", bid=".72", ask=".73", ts=NOW):
@@ -178,9 +225,11 @@ def test_other_market_message_is_not_misattributed():
 
 
 @pytest.mark.asyncio
-async def test_reader_keeps_receiving_after_bbo_on_same_socket(monkeypatch):
-    c = BBOEvidence("c", SPECS, "ws-test", post_seconds=.005)
-    now = time.time()
+async def test_reader_keeps_receiving_after_bbo_on_same_socket(monkeypatch, collector_clock):
+    # Exercise real tasks/wait_for, but do not race three frames against 5ms.
+    monkeypatch.setattr(probe, "asyncio", asyncio)
+    c = BBOEvidence("c", SPECS, "ws-test")
+    now = collector_clock.time()
     messages = [encode([book(ts=now), book("22", ".27", ".28", now)]),
                 encode([mismatch(now)]), encode(book(bid=".69", ts=now))]
     calls, sent = [], []
@@ -189,13 +238,14 @@ async def test_reader_keeps_receiving_after_bbo_on_same_socket(monkeypatch):
         calls.append(1)
         if messages:
             return messages.pop(0)
-        await asyncio.sleep(1)
+        collector_clock.advance(2)
+        return "PONG"
 
     async def send(data):
         sent.append(data)
 
     ws = SimpleNamespace(recv=recv, send=send)
-    reason = await probe.read_connection(ws, c, now + 300, time.monotonic() + 2)
+    reason = await probe.read_connection(ws, c, now + 300, collector_clock.monotonic() + 30)
     assert reason == "tail_complete" and len(calls) >= 3
     assert c.episode["post_frames"][0]["messages"][0]["event_type"] == "book"
     assert not any(b.ready for b in c.cache.books.values())
@@ -203,16 +253,25 @@ async def test_reader_keeps_receiving_after_bbo_on_same_socket(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_network_error_preserves_partial_incident_before_close(monkeypatch):
-    market = {"condition": "c", "specs": SPECS, "end": time.time() + 300}
-    captures = []
+@pytest.mark.parametrize(("seconds", "early_wake", "expected", "termination"), [
+    pytest.param(.05, False, 1, "run_deadline", id="deadline-after-first-failure"),
+    pytest.param(.05, True, 2, "run_deadline", id="early-wake-allows-retry"),
+    pytest.param(10, False, 3, "incident_limit_with_partial_tails", id="partial-incident-cap"),
+])
+async def test_network_error_preserves_partial_incident_before_close(
+    monkeypatch, collector_clock, seconds, early_wake, expected, termination,
+):
+    collector_clock.early_first_wake = early_wake
+    market = {"condition": "c", "specs": SPECS, "end": collector_clock.time() + 300}
+    captures, closed = [], []
 
     async def discovery(*args):
         return market
 
     async def reader(ws, capture, *args):
-        capture.feed(encode([book(), book("22")]), NOW, MONO)
-        trigger(capture)
+        wall, ns = collector_clock.time(), collector_clock.perf_counter_ns()
+        capture.feed(encode([book(ts=wall), book("22", ts=wall)]), wall, ns)
+        capture.feed(encode(mismatch(wall)), wall, ns)
         captures.append(capture)
         raise ConnectionError("SECRET")
 
@@ -221,15 +280,28 @@ async def test_network_error_preserves_partial_incident_before_close(monkeypatch
             return object()
 
         async def __aexit__(self, *args):
-            # collect must have finished capture BEFORE websocket teardown.
+            # Every retry must finish its own incident BEFORE websocket teardown.
             if captures:
-                assert captures[-1].episode.get("end_reason") == "transport_ConnectionError"
+                episode = captures[-1].episode
+                assert episode["end_reason"] == "transport_ConnectionError"
+                assert episode["post_window_complete"] is False
+                assert episode["post_seconds_observed"] == 0
+                closed.append(episode["session_id"])
 
     monkeypatch.setattr(probe, "discover", discovery)
     monkeypatch.setattr(probe, "read_connection", reader)
-    r = await probe.collect(.05, 1, connector=lambda *a, **kw: Context(), http_factory=lambda **kw: Context())
-    assert len(r["incidents"]) == 1
-    assert not r["incidents"][0]["post_window_complete"]
+    r = await probe.collect(seconds, 1, connector=lambda *a, **kw: Context(), http_factory=lambda **kw: Context())
+    assert len(r["incidents"]) == len(r["sessions"]) == len(captures) == expected
+    assert len({x["session_id"] for x in r["incidents"]}) == expected
+    assert {x["session_id"] for x in r["incidents"]} <= set(closed)
+    assert all(x["end_reason"] == "transport_ConnectionError" for x in r["incidents"])
+    assert all(x["post_window_complete"] is False for x in r["incidents"])
+    assert all(s["end_reason"] == "transport_ConnectionError" for s in r["sessions"])
+    assert all(not b.ready for c in captures for b in c.cache.books.values())
+    assert r["summary"]["complete_post_windows"] == 0
+    assert r["termination"] == termination
+    assert r["summary"]["root_cause_verified"] is False
+    assert r["summary"]["profit_experiment_enabled"] is False
     assert b"SECRET" not in encode(r)
 
 
@@ -306,18 +378,18 @@ async def test_discovery_reads_only_metadata_and_never_seeds_http_depth(monkeypa
 
 
 @pytest.mark.asyncio
-async def test_collect_auto_stops_at_target_and_excludes_close_wait(monkeypatch):
-    market = {"condition": "c", "specs": SPECS, "end": time.time() + 300}
+async def test_collect_auto_stops_at_target_and_excludes_close_wait(monkeypatch, collector_clock):
+    market = {"condition": "c", "specs": SPECS, "end": collector_clock.time() + 300}
     captures = []
 
     async def discovery(*args):
         return market
 
     async def reader(ws, capture, *args):
-        now, ns = time.time(), time.perf_counter_ns()
+        now, ns = collector_clock.time(), collector_clock.perf_counter_ns()
         capture.feed(encode([book(ts=now), book("22", ts=now)]), now, ns)
-        capture.feed(encode(mismatch(now)), now, ns + 1)
-        capture.post_seconds = 0  # deterministic transport test; no wall-time sleep
+        capture.feed(encode(mismatch(now)), now, ns)
+        collector_clock.advance(2)  # Preserve the actual two-second tail contract.
         captures.append(capture)
         return "tail_complete"
 
@@ -328,17 +400,22 @@ async def test_collect_auto_stops_at_target_and_excludes_close_wait(monkeypatch)
         async def __aexit__(self, *args):
             if captures:
                 assert captures[-1].episode["post_window_complete"]
+                assert captures[-1].episode["post_seconds_observed"] == 2
+                collector_clock.advance(10)  # Closing is not part of tail observation.
 
     monkeypatch.setattr(probe, "discover", discovery)
     monkeypatch.setattr(probe, "read_connection", reader)
-    r = await probe.collect(1, 1, connector=lambda *a, **kw: Context(), http_factory=lambda **kw: Context())
+    r = await probe.collect(30, 1, connector=lambda *a, **kw: Context(), http_factory=lambda **kw: Context())
     assert r["termination"] == "target_complete"
     assert len(r["sessions"]) == len(r["incidents"]) == 1
+    assert r["incidents"][0]["post_seconds_observed"] == 2
+    assert r["sessions"][0]["end_reason"] == "tail_complete"
+    assert collector_clock.sleeps == []  # No extra connection after reaching target.
     assert r["summary"]["root_cause_verified"] is False
 
 
 @pytest.mark.asyncio
-async def test_zero_incident_report_does_not_claim_repair(monkeypatch):
+async def test_zero_incident_report_does_not_claim_repair(monkeypatch, collector_clock):
     async def broken(*args):
         raise ConnectionError("PRIVATE_PROXY_BODY")
 
@@ -353,5 +430,50 @@ async def test_zero_incident_report_does_not_claim_repair(monkeypatch):
     r = await probe.collect(.01, 1, http_factory=lambda **kw: Context())
     assert r["summary"]["complete_post_windows"] == 0
     assert r["summary"]["root_cause_verified"] is False
+    assert r["incidents"] == [] and len(r["sessions"]) == 1
+    assert r["termination"] == "run_deadline"
     assert b"PRIVATE_PROXY_BODY" not in encode(r)
     assert r["sessions"][0]["end_reason"] == "setup_ConnectionError"
+
+
+@pytest.mark.asyncio
+async def test_collect_retries_partial_then_stops_at_complete_target(monkeypatch, collector_clock):
+    market = {"condition": "c", "specs": SPECS, "end": collector_clock.time() + 300}
+    captures = []
+
+    async def discovery(*args):
+        return market
+
+    async def reader(ws, capture, *args):
+        wall, ns = collector_clock.time(), collector_clock.perf_counter_ns()
+        capture.feed(encode([book(ts=wall), book("22", ts=wall)]), wall, ns)
+        capture.feed(encode(mismatch(wall)), wall, ns)
+        captures.append(capture)
+        if len(captures) == 1:
+            raise ConnectionError("PRIVATE_BODY")
+        collector_clock.advance(2)
+        return "tail_complete"
+
+    class Context:
+        async def __aenter__(self):
+            return object()
+
+        async def __aexit__(self, *args):
+            if captures:
+                episode = captures[-1].episode
+                complete = len(captures) == 2
+                assert episode["post_window_complete"] is complete
+                assert episode["end_reason"] == ("tail_complete" if complete else "transport_ConnectionError")
+
+    monkeypatch.setattr(probe, "discover", discovery)
+    monkeypatch.setattr(probe, "read_connection", reader)
+    r = await probe.collect(30, 1, connector=lambda *a, **kw: Context(), http_factory=lambda **kw: Context())
+    assert len(r["sessions"]) == len(r["incidents"]) == len(captures) == 2
+    assert [x["post_window_complete"] for x in r["incidents"]] == [False, True]
+    assert [x["post_seconds_observed"] for x in r["incidents"]] == [0, 2]
+    assert [x["end_reason"] for x in r["sessions"]] == ["transport_ConnectionError", "tail_complete"]
+    assert r["summary"]["complete_post_windows"] == 1
+    assert r["termination"] == "target_complete" and collector_clock.sleeps == [1.0]
+    assert r["summary"]["root_cause_verified"] is False
+    assert r["summary"]["profit_experiment_enabled"] is False
+    assert b"PRIVATE_BODY" not in encode(r)
