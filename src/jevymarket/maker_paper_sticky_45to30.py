@@ -12,15 +12,59 @@ from pathlib import Path
 from .maker import MakerRuntime
 from .maker_config import MakerConfig
 from .maker_diagnostics import diagnostic_report
-from .maker_engine import choose_quote
+from .maker_engine import Quote, choose_quote
+from .maker_model import floor_step
 from .maker_paper_gate import evaluate_statistics
 from .maker_store import MakerStore, readonly, single_process, statistics
 from .run_paths import run_output_path
 
-REVISION = "v6-paper-sticky-45to30-r1"
+REVISION = "v6-paper-sticky-improve1-45to30-r2"
 ENTRY_SECONDS = 45.0
 CANCEL_SECONDS = 30.0
 QUOTE_TTL_SECONDS = 5.0
+PRICE_IMPROVE_TICKS = 1
+
+
+
+def improve_quote_one_tick(base: Quote | None, cache, config: MakerConfig, budget: float) -> Quote | None:
+    """Improve by at most one tick while remaining post-only and above min edge."""
+    if base is None:
+        return None
+    book = cache.books.get(base.token)
+    if book is None or book.bid is None or book.ask is None:
+        return None
+
+    max_safe = min(
+        base.fair_p - config.min_edge,
+        config.max_price,
+        book.ask - book.tick,
+    )
+    target = floor_step(min(book.bid + book.tick * PRICE_IMPROVE_TICKS, max_safe), book.tick)
+    price = max(base.price, target)
+    price = floor_step(price, book.tick)
+
+    if not config.min_price <= price <= config.max_price or price >= book.ask:
+        return None
+    if base.fair_p - price < config.min_edge - 1e-9:
+        return None
+
+    cash = min(budget, config.max_order_usd, config.capital_usd * config.risk_fraction)
+    size = floor_step(
+        min(cash / price, config.max_market_profit_usd / (1 - price)),
+        0.01,
+    )
+    if size < book.minimum or size <= 0:
+        return None
+
+    return Quote(
+        token=base.token,
+        outcome=base.outcome,
+        price=price,
+        size=size,
+        fair_p=base.fair_p,
+        model_p=base.model_p,
+        market_p=base.market_p,
+    )
 
 
 def trial_config() -> MakerConfig:
@@ -52,7 +96,10 @@ class StickyMakerRuntime(MakerRuntime):
                     raise ValueError("outside_entry_window")
                 est = self.reference.estimate(self.market.start, self.market.window, wall)
                 budget = self.c.max_order_usd if active else self.engine.budget(self.market.slug, wall)
-                desired, reason = choose_quote(self.market, self.cache, est, self.c, wall, mono, budget)
+                base, reason = choose_quote(self.market, self.cache, est, self.c, wall, mono, budget)
+                desired = improve_quote_one_tick(base, self.cache, self.c, budget)
+                if base is not None and desired is None:
+                    reason = "price_improvement_invalid"
             except ValueError as exc:
                 reason = str(exc)
 
@@ -75,15 +122,19 @@ class StickyMakerRuntime(MakerRuntime):
         self.engine.advance(self.cache, wall, mono, safe)
 
         if self.engine.active() is None and desired and safe:
-            desired, reason = choose_quote(
+            budget = self.engine.budget(self.market.slug, wall)
+            base, reason = choose_quote(
                 self.market,
                 self.cache,
                 est,
                 self.c,
                 wall,
                 mono,
-                self.engine.budget(self.market.slug, wall),
+                budget,
             )
+            desired = improve_quote_one_tick(base, self.cache, self.c, budget)
+            if base is not None and desired is None:
+                reason = "price_improvement_invalid"
             if desired:
                 self.engine.submit(self.market, self.cache, desired, wall, mono)
 
@@ -112,6 +163,7 @@ def compact_report(db: Path, out: Path) -> dict:
             "cancel_before_end_seconds": CANCEL_SECONDS,
             "quote_ttl_seconds": QUOTE_TTL_SECONDS,
             "sticky_queue_priority": True,
+            "price_improve_ticks": PRICE_IMPROVE_TICKS,
         },
         "statistics": stats,
         "performance_gate": evaluate_statistics(stats),
@@ -123,6 +175,7 @@ def compact_report(db: Path, out: Path) -> dict:
             "Public prints plus L2 queue-ahead are paper fill estimates, not authenticated own fills.",
             "Same-price cancellations ahead of our hypothetical order are not observable, so the queue model may undercount fills.",
             "Sticky behavior preserves a safe old price but still cancels on stale/invalid books, direction changes, edge loss or T-30.",
+            "A candidate may improve the current best bid by one tick only when spread and minimum-edge constraints still permit post-only quoting.",
             "A >65% paper win rate is only a project gate, not a profitability guarantee.",
         ],
     }
@@ -145,15 +198,15 @@ def main(argv=None):
         parser.error("seconds必须在1800到86400之间")
 
     stamp = datetime.now(timezone(timedelta(hours=8))).strftime("%Y%m%d_%H%M%S_%f")
-    db = run_output_path(args.db, f"jevymarket.paper-sticky-45to30_{stamp}.db")
-    out = run_output_path(args.out, f"v6_paper_sticky_45to30_{stamp}.json.gz")
+    db = run_output_path(args.db, f"jevymarket.paper-sticky-improve1-45to30_{stamp}.db")
+    out = run_output_path(args.out, f"v6_paper_sticky_improve1_45to30_{stamp}.json.gz")
     if db.exists() or out.exists():
         raise FileExistsError("Sticky纸面实验输出已存在；拒绝覆盖或混入旧实验")
 
     config = trial_config()
     print(
         f"{REVISION} | 纸面post-only | {ENTRY_SECONDS:g}→{CANCEL_SECONDS:g}秒"
-        f" | TTL={QUOTE_TTL_SECONDS:g}s | 安全旧单不追价 | 无真实下单",
+        f" | TTL={QUOTE_TTL_SECONDS:g}s | 安全旧单不追价 | 可提高1tick抢队首 | 无真实下单",
         flush=True,
     )
     with single_process(db):
