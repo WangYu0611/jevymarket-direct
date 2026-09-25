@@ -52,9 +52,10 @@ def checkpoint(seconds_left: int | None) -> int | None:
 def quant_direction(p: float | None) -> str | None:
     if p is None or not math.isfinite(p):
         return None
-    if p >= QUANT_CONFIDENCE:
+    tolerance = 1e-12
+    if p >= QUANT_CONFIDENCE - tolerance:
         return "UP"
-    if p <= 1 - QUANT_CONFIDENCE:
+    if p <= 1 - QUANT_CONFIDENCE + tolerance:
         return "DOWN"
     return None
 
