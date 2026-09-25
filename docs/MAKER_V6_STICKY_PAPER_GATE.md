@@ -11,15 +11,16 @@ Changes relative to the preceding 45→30 paper runner:
 - Same 0.92 confidence threshold, model, price/spread rules, 1s book freshness, size/risk caps and BBO recovery.
 - Quote TTL increases from 2s to 5s.
 - A safe resting order does not cancel just because the newly desired maker price moves.
+- New quotes may improve the current best bid by one tick when the spread, post-only constraint and minimum edge all remain valid. This targets queue position rather than relaxing confidence.
 - It still cancels on stale/invalid book data, book generation changes, direction change,
   edge loss, crossing risk, TTL, disconnect, or the T-30 cutoff.
 - Paper fills remain estimates from public prints and L2 queue-ahead. Same-price cancellations
   ahead of our hypothetical order are not observable, so this simulator may undercount fills.
 
-Default run length is 4 hours and all outputs go to `runs/`:
+For the first validation, use a 2-hour run and all outputs go to `runs/`:
 
 ```powershell
-uv run --frozen python -m jevymarket.maker_paper_sticky_45to30 --seconds 14400
+uv run --frozen python -m jevymarket.maker_paper_sticky_45to30 --seconds 7200
 ```
 
 ## Project gate before any future real-money discussion

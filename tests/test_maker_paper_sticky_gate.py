@@ -3,10 +3,10 @@ from types import SimpleNamespace
 import pytest
 
 from jevymarket.maker_book import BookCache
-from jevymarket.maker_engine import Market
+from jevymarket.maker_engine import Market, choose_quote
 from jevymarket.maker_model import Estimate
 from jevymarket.maker_paper_gate import evaluate_statistics
-from jevymarket.maker_paper_sticky_45to30 import StickyMakerRuntime, trial_config
+from jevymarket.maker_paper_sticky_45to30 import StickyMakerRuntime, improve_quote_one_tick, trial_config
 
 START = 1_800_000_000
 WALL = START + 260.0  # T-40
@@ -41,6 +41,42 @@ def runtime_fixture():
     runtime.metadata_ts = WALL
     runtime.reference = SimpleNamespace(estimate=lambda *args: estimate)
     return runtime, cache, emitted
+
+
+
+def test_one_tick_improvement_can_take_queue_front_without_crossing():
+    config = trial_config()
+    cache = BookCache(CONDITION, {"11": (.01, 5), "22": (.01, 5)})
+    cache.apply(snapshot("11", .91, .95, WALL), WALL, 100)
+    cache.apply(snapshot("22", .05, .09, WALL), WALL, 100)
+    estimate = Estimate(.98, WALL, WALL - .1, WALL - .1, 100, 110, 109, 2, 0)
+
+    base, reason = choose_quote(MARKET, cache, estimate, config, WALL, 100, 5)
+    assert reason == "quote_ready"
+    assert base is not None and base.price == .91
+
+    improved = improve_quote_one_tick(base, cache, config, 5)
+    assert improved is not None
+    assert improved.price == .92
+    assert improved.price < cache.books["11"].ask
+    assert improved.fair_p - improved.price >= config.min_edge - 1e-9
+    assert cache.books["11"].ahead(improved.price) == 0
+    assert improved.price * improved.size <= 5 + 1e-9
+
+
+def test_one_tick_improvement_never_crosses_one_tick_spread():
+    config = trial_config()
+    cache = BookCache(CONDITION, {"11": (.01, 5), "22": (.01, 5)})
+    cache.apply(snapshot("11", .94, .95, WALL), WALL, 100)
+    cache.apply(snapshot("22", .05, .06, WALL), WALL, 100)
+    estimate = Estimate(.98, WALL, WALL - .1, WALL - .1, 100, 110, 109, 2, 0)
+
+    base, reason = choose_quote(MARKET, cache, estimate, config, WALL, 100, 5)
+    assert reason == "quote_ready"
+    improved = improve_quote_one_tick(base, cache, config, 5)
+    assert improved is not None
+    assert improved.price == base.price
+    assert improved.price < cache.books["11"].ask
 
 
 def test_sticky_order_keeps_queue_when_new_desired_price_moves_up():

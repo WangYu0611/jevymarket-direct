@@ -29,7 +29,12 @@ def floor_step(value: float, step: float) -> float:
     v, s = Decimal(str(value)), Decimal(str(step))
     if not v.is_finite() or not s.is_finite() or s <= 0:
         raise ValueError("invalid_tick")
-    return float((v / s).to_integral_value(rounding=ROUND_FLOOR) * s)
+    # Float-derived probabilities/prices can land a few ulps below an exact
+    # tick (e.g. 0.9199999999999999 instead of 0.92). Add only one-billionth
+    # of a step before flooring: enough to absorb representation noise, far
+    # too small to promote a genuinely off-tick economic value.
+    tolerance = s * Decimal("1e-9")
+    return float(((v + tolerance) / s).to_integral_value(rounding=ROUND_FLOOR) * s)
 
 
 def twap_window(description: str, resolution_source: str) -> int:

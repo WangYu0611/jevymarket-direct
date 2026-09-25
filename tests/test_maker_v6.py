@@ -285,6 +285,8 @@ def test_integral_and_gap_guard():
         integral(rows, 0, 5, 1)
     assert floor_step(.9325, .0025) == .9325
     assert floor_step(.9399, .01) == .93
+    assert floor_step(.92 - 1e-16, .01) == .92
+    assert floor_step(.919999, .01) == .91
 
 
 def metadata():
