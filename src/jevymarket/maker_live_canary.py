@@ -24,6 +24,7 @@ from .maker import MakerRuntime
 from .maker_config import MakerConfig
 from .maker_diagnostics import diagnostic_report
 from .maker_engine import Quote, choose_quote
+from .maker_paper_gate import evaluate_path
 from .maker_store import MakerStore, single_process
 from .run_paths import run_output_path
 
@@ -433,6 +434,7 @@ async def async_main(args) -> dict:
         "post_only_required": True,
         "max_rest_seconds": MAX_REST_SECONDS,
         "started_wall": time.time(),
+        "paper_performance_gate": getattr(args, "paper_gate", None),
     }
     if not _valid_private_key(settings.polymarket_private_key):
         report["termination"] = "private_key_missing_or_invalid"
@@ -492,13 +494,26 @@ def main(argv=None):
     group.add_argument("--check-only", action="store_true", help="仅认证/余额/审批/未结订单检查，不下单")
     group.add_argument("--live-one", action="store_true", help="最多提交1个真实post-only订单")
     parser.add_argument("--confirm", default="")
+    parser.add_argument("--paper-report", type=Path,
+                        help="真实模式必须提供已通过绩效门槛的纸面报告；check-only不需要")
     parser.add_argument("--seconds", type=int, default=900, choices=range(300, 1801))
     parser.add_argument("--db", type=Path)
     parser.add_argument("--out", type=Path)
     args = parser.parse_args(argv)
 
-    if args.live_one and args.confirm != CONFIRM_PHRASE:
-        parser.error(f"真实下单必须显式添加 --confirm {CONFIRM_PHRASE}")
+    args.paper_gate = None
+    if args.live_one:
+        if args.confirm != CONFIRM_PHRASE:
+            parser.error(f"真实下单必须显式添加 --confirm {CONFIRM_PHRASE}")
+        if args.paper_report is None:
+            parser.error("真实模式必须提供 --paper-report，并且纸面绩效门槛已通过")
+        try:
+            args.paper_gate = evaluate_path(args.paper_report)
+        except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
+            parser.error(f"无法验证纸面绩效报告：{type(exc).__name__}")
+        if not args.paper_gate["passed"]:
+            print(json.dumps(args.paper_gate, ensure_ascii=False, indent=2))
+            parser.error("纸面绩效门槛未通过：不会连接真实账户或进入真实下单路径")
 
     stamp = datetime.now(timezone(timedelta(hours=8))).strftime("%Y%m%d_%H%M%S_%f")
     args.db_name = f"jevymarket.live-canary_{stamp}.db"
