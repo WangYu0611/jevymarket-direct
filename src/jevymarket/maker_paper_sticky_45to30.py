@@ -25,7 +25,6 @@ QUOTE_TTL_SECONDS = 5.0
 PRICE_IMPROVE_TICKS = 1
 
 
-
 def improve_quote_one_tick(base: Quote | None, cache, config: MakerConfig, budget: float) -> Quote | None:
     """Improve by at most one tick while remaining post-only and above min edge."""
     if base is None:
