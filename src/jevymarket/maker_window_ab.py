@@ -17,6 +17,7 @@ from .maker_diagnostics import diagnostic_report
 from .maker_engine import choose_quote
 from .maker_protocol import data_health
 from .maker_store import MakerStore, readonly, single_process
+from .run_paths import run_output_path
 
 REVISION = "v6-window-ab-r1"
 SAMPLE_SECONDS = 1.0
@@ -235,8 +236,8 @@ def main(argv=None):
     args = parser.parse_args(argv)
 
     stamp = datetime.now(timezone(timedelta(hours=8))).strftime("%Y%m%d_%H%M%S_%f")
-    db = args.db or Path(f"jevymarket.window-ab_{stamp}.db")
-    out = args.out or Path(f"v6_window_ab_{stamp}.json.gz")
+    db = run_output_path(args.db, f"jevymarket.window-ab_{stamp}.db")
+    out = run_output_path(args.out, f"v6_window_ab_{stamp}.json.gz")
     if db.exists() or out.exists():
         raise FileExistsError("A/B输出已存在；拒绝覆盖或混入旧实验")
 
