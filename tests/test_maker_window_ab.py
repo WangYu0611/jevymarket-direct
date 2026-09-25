@@ -62,6 +62,8 @@ def test_aggregate_uses_rates_and_complete_market_pairing():
     assert result["paired_candidate_matrix"] == {"both": 1}
     assert result["arms"]["A_late_30_to_10"]["candidate_sample_rate"] == pytest.approx(1/5)
     assert result["arms"]["B_early_60_to_20"]["candidate_sample_rate"] == pytest.approx(1/5)
+    assert result["bands"]["B_60_to_40"]["candidate_rate"] == pytest.approx(1/2)
+    assert result["overlap_decision_mismatches"] == 0
 
 
 def test_complete_window_requires_both_edges():
