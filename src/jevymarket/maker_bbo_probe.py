@@ -15,6 +15,7 @@ from pathlib import Path
 
 from .maker_bbo_evidence import EPISODE_BYTES, FRAME_BYTES, PROBE_REVISION, BBOEvidence, encode
 from .maker_model import finite
+from .run_paths import run_output_path
 
 GAMMA = "https://gamma-api.polymarket.com"
 CLOB = "https://clob.polymarket.com"
@@ -201,7 +202,7 @@ def main(argv=None):
     parser.add_argument("--out", type=Path)
     args = parser.parse_args(argv)
     stamp = datetime.now(timezone(timedelta(hours=8))).strftime("%Y%m%d_%H%M%S_%f")
-    out = args.out or Path(f"v6_bbo_probe_{stamp}.json.gz")
+    out = run_output_path(args.out, f"v6_bbo_probe_{stamp}.json.gz")
     if not out.name.endswith(".json.gz"):
         parser.error("输出文件必须以.json.gz结尾")
     out.parent.mkdir(parents=True, exist_ok=True)
