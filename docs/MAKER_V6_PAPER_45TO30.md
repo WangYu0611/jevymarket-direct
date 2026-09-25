@@ -15,6 +15,6 @@ Run:
 uv run --frozen python -m jevymarket.maker_paper_45to30 --seconds 3600
 ```
 
-This creates a new database and `v6_paper_45to30_*.json.gz`. The report contains paper orders, execution events, statistics and the latest diagnostic summary.
+This creates a new database and `runs/v6_paper_45to30_*.json.gz`; both live under `runs/` by default. The report contains paper orders, execution events, statistics and the latest diagnostic summary.
 
 This is not live trading and is not evidence of profitability.
