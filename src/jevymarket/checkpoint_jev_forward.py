@@ -15,7 +15,7 @@ import time
 import uuid
 from collections import Counter
 from contextlib import AsyncExitStack
-from datetime import UTC, datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from polymarket import AsyncPublicClient
