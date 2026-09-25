@@ -424,7 +424,7 @@ def write_report(report: dict, out: Path) -> None:
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description="BTC5m checkpoint + Jev 前向预测实验；无订单")
-    parser.add_argument("--seconds", type=int, default=14400)
+    parser.add_argument("--seconds", type=int, default=21600)
     parser.add_argument("--loop", type=float, default=INTERVAL_SECONDS)
     parser.add_argument("--db", type=Path)
     parser.add_argument("--out", type=Path)
