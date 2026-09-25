@@ -1,5 +1,3 @@
-from types import SimpleNamespace
-
 import pytest
 
 from jevymarket.maker_config import MakerConfig
