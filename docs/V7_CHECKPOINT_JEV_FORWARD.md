@@ -78,3 +78,52 @@ runs/v7_checkpoint_jev_forward_*.json.gz
 ```
 
 Upload only the gzip report for analysis. Do not upload `.env`.
+
+
+## Clear terminal dashboard
+
+The terminal now uses highlighted panels instead of relying on plain log lines.
+
+At each checkpoint it shows:
+
+- Quant direction and directional probability;
+- Polymarket direction and probability of the Quant-predicted side;
+- Quant minus Market probability edge in percentage points;
+- whether Arm A has a signal;
+- whether Jev is pending or skipped.
+
+When Jev returns, a second highlighted panel shows:
+
+- Jev direction/probability;
+- answerability and clarity;
+- Jev latency;
+- A / B / C pass/filter status.
+
+A cumulative scoreboard is printed whenever settled results change:
+
+```text
+前向预测累计成绩（独立已结算市场）
+A Quant                 48   48/0   100.0%   距50=2
+B Quant + Jev           47   47/0   100.0%   距50=3
+C Quant + Jev + Market  47   47/0   100.0%   距50=3
+```
+
+The report also records directional Quant-vs-Market and Jev-vs-Market edge diagnostics.
+No edge threshold is introduced in this dataset; the values are collected for the
+next preregistered price-value experiment.
+
+## Resume an existing forward database
+
+Do not throw away a nearly-complete independent-market sample just to improve the UI.
+An existing v7 database can be continued:
+
+```powershell
+uv run --frozen python -m jevymarket.checkpoint_jev_forward \
+    --resume-db "runs/jevymarket.forward-jev_20260925_182857_021098.db" \
+    --seconds 3600
+```
+
+The stored experiment manifest is checked before appending. Existing market/checkpoint
+rows are not duplicated because the database enforces one recorded checkpoint per
+market/checkpoint. A new cumulative report is written under `runs/`; the source
+database is retained.

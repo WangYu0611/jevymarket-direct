@@ -11,6 +11,7 @@ import asyncio
 import gzip
 import json
 import math
+import statistics
 import time
 import uuid
 from collections import Counter
@@ -20,6 +21,8 @@ from pathlib import Path
 
 from polymarket import AsyncPublicClient
 from rich.console import Console
+from rich.panel import Panel
+from rich.table import Table
 
 from .fast_cli import single_instance
 from .fast_runner import FastRunner, JevShadow, settle_some, settlement_worker
@@ -31,6 +34,7 @@ from .run_paths import run_output_path
 from .signal import quantitative_up_probability
 
 REVISION = "v7-checkpoint-jev-forward-r1"
+REPORT_FORMAT = "v7-checkpoint-jev-forward-report-r2"
 CHECKPOINTS = (120, 90, 60, 45)
 CHECKPOINT_LATENESS_SECONDS = 10
 INTERVAL_SECONDS = 10.0
@@ -38,6 +42,191 @@ QUANT_CONFIDENCE = 0.92
 MIN_RESOLVED_SIGNALS = 50
 REQUIRED_WIN_RATE = 0.65
 ARMS = ("A_quant", "B_quant_jev", "C_quant_jev_market")
+
+
+
+def side_probability(p: float | None, direction: str | None) -> float | None:
+    if p is None or direction not in {"UP", "DOWN"} or not math.isfinite(p) or not 0 <= p <= 1:
+        return None
+    return p if direction == "UP" else 1 - p
+
+
+def directional_edge(row: dict, model_field: str = "quant_p") -> float | None:
+    direction = row.get("signal_direction")
+    model = side_probability(row.get(model_field), direction)
+    market = side_probability(row.get("market_p"), direction)
+    if model is None or market is None:
+        return None
+    return model - market
+
+
+def edge_metrics(signals: list[dict], model_field: str = "quant_p") -> dict:
+    values = [directional_edge(r, model_field) for r in signals]
+    values = [v for v in values if v is not None]
+    return {
+        "n": len(values),
+        "positive": sum(v > 0 for v in values),
+        "positive_fraction": sum(v > 0 for v in values) / len(values) if values else None,
+        "mean": sum(values) / len(values) if values else None,
+        "median": statistics.median(values) if values else None,
+        "min": min(values) if values else None,
+        "max": max(values) if values else None,
+    }
+
+
+def _pct(p: float | None) -> str:
+    return "—" if p is None else f"{100 * p:.1f}%"
+
+
+def _direction_style(direction: str | None) -> str:
+    if direction == "UP":
+        return "[bold green]UP ↑[/]"
+    if direction == "DOWN":
+        return "[bold red]DOWN ↓[/]"
+    return "[dim]无信号[/]"
+
+
+def print_checkpoint_panel(console: Console, row: dict) -> None:
+    qdir = quant_direction(row.get("quant_p"))
+    market_dir = probability_direction(row.get("market_p"))
+    qside = side_probability(row.get("quant_p"), qdir)
+    mside = side_probability(row.get("market_p"), qdir)
+    edge = qside - mside if qside is not None and mside is not None else None
+
+    table = Table.grid(padding=(0, 2))
+    table.add_column(style="bold")
+    table.add_column()
+    table.add_row("市场", row["slug"])
+    table.add_row("Quant", f"{_direction_style(qdir)}  {_pct(qside)}")
+    table.add_row("Polymarket", f"{_direction_style(market_dir)}  P(预测方向)={_pct(mside)}")
+    table.add_row("Quant - Market", "—" if edge is None else f"[bold cyan]{edge * 100:+.2f} pp[/]")
+    if qdir is None:
+        table.add_row("A Quant", "[yellow]不出信号[/]")
+        table.add_row("Jev", "[dim]跳过：Quant未达到92%[/]")
+        table.add_row("B / C", "[dim]不出信号[/]")
+    else:
+        table.add_row("A Quant", f"[bold green]SIGNAL {qdir}[/]")
+        table.add_row("Jev", "[bold yellow]异步确认中…[/]")
+        table.add_row("B / C", "[yellow]等待Jev[/]")
+
+    console.print(Panel(
+        table,
+        title=f"[bold cyan] BTC 5m CHECKPOINT  T-{row['checkpoint']}s [/]",
+        border_style="cyan",
+        expand=False,
+    ))
+
+
+def print_jev_panel(console: Console, row: dict, parameters: dict) -> None:
+    qdir = quant_direction(row.get("quant_p"))
+    jdir = probability_direction(row.get("jev_p"))
+    mdir = probability_direction(row.get("market_p"))
+    quality = jev_quality(row, parameters)
+    bdir = arm_direction(row, "B_quant_jev", parameters)
+    cdir = arm_direction(row, "C_quant_jev_market", parameters)
+    latency = None
+    if row.get("jev_requested_ts") is not None and row.get("jev_received_ts") is not None:
+        latency = row["jev_received_ts"] - row["jev_requested_ts"]
+
+    table = Table.grid(padding=(0, 2))
+    table.add_column(style="bold")
+    table.add_column()
+    table.add_row("市场", row["slug"])
+    table.add_row("Quant", f"{_direction_style(qdir)}  {_pct(side_probability(row.get('quant_p'), qdir))}")
+    table.add_row("Jev", f"{_direction_style(jdir)}  {_pct(side_probability(row.get('jev_p'), jdir))}")
+    table.add_row(
+        "Jev质量",
+        f"answerable={_pct(row.get('jev_answerable'))} | clarity={row.get('jev_clarity')} | "
+        f"{'[green]PASS[/]' if quality else '[red]FAIL[/]'}",
+    )
+    table.add_row("Polymarket", f"{_direction_style(mdir)}  {_pct(side_probability(row.get('market_p'), mdir))}")
+    table.add_row("Jev延迟", "—" if latency is None else f"{latency:.2f}s")
+    table.add_row("A Quant", f"[green]✓ {qdir}[/]" if qdir else "[dim]—[/]")
+    table.add_row("B + Jev", f"[green]✓ {bdir}[/]" if bdir else "[red]✗ 过滤[/]")
+    table.add_row("C + Jev + Market", f"[green]✓ {cdir}[/]" if cdir else "[red]✗ 过滤[/]")
+
+    console.print(Panel(
+        table,
+        title="[bold magenta] JEV CONFIRMATION [/]",
+        border_style="magenta",
+        expand=False,
+    ))
+
+
+def print_scoreboard(console: Console, report: dict, *, final: bool = False) -> None:
+    table = Table(
+        title="前向预测累计成绩（独立已结算市场）" + (" · FINAL" if final else ""),
+        show_header=True,
+        header_style="bold white",
+    )
+    for col in ("组别", "已结算", "胜 / 负", "胜率", "距50", "95%下限", "状态"):
+        table.add_column(col)
+    labels = {
+        "A_quant": "A  Quant",
+        "B_quant_jev": "B  Quant + Jev",
+        "C_quant_jev_market": "C  Quant + Jev + Market",
+    }
+    for arm in ARMS:
+        m = report["arms"][arm]
+        n = m["resolved_signal_markets"]
+        need = max(0, MIN_RESOLVED_SIGNALS - n)
+        status = "[bold green]PASS[/]" if m["gate"]["passed"] else (
+            "[yellow]样本不足[/]" if need else "[red]胜率未过[/]"
+        )
+        table.add_row(
+            labels[arm],
+            str(n),
+            f"{m['wins']} / {m['losses']}",
+            _pct(m["win_rate"]),
+            str(need),
+            _pct(m["wilson_95"]["lower"]),
+            status,
+        )
+    console.print(table)
+    cov = report["coverage"]
+    console.print(
+        f"[dim]checkpoint市场={cov['checkpoint_markets']} | 已结算checkpoint市场={cov['resolved_checkpoint_markets']} | "
+        f"Jev成功={cov['jev_success']}/{cov['jev_requested']} | 不生成订单[/]"
+    )
+
+
+async def jev_display_worker(store: FastStore, version: str, console: Console) -> None:
+    parameters = store.parameters(version) or {}
+    seen = {r["id"] for r in store.observations(version, checkpoints_only=True)}
+    terminal = {"ok", "error", "expired", "disabled_auth", "disabled", "busy", "interrupted", "not_eligible_quant"}
+    while True:
+        for row in store.observations(version, checkpoints_only=True):
+            if row["id"] in seen or row.get("jev_status") not in terminal:
+                continue
+            seen.add(row["id"])
+            if row.get("jev_status") == "ok":
+                print_jev_panel(console, row, parameters)
+            elif row.get("jev_status") not in {"not_eligible_quant"}:
+                console.print(Panel(
+                    f"市场 {row['slug']} · T-{row['checkpoint']}s\n"
+                    f"Jev状态：[bold red]{row.get('jev_status')}[/]\n"
+                    "该checkpoint不会伪造Jev结果，Quant记录仍保留。",
+                    title="[bold red] JEV 未完成 [/]",
+                    border_style="red",
+                    expand=False,
+                ))
+        await asyncio.sleep(.5)
+
+
+async def dashboard_worker(store: FastStore, version: str, console: Console) -> None:
+    last = None
+    while True:
+        report = build_report(store, version)
+        key = tuple(
+            (report["arms"][arm]["resolved_signal_markets"],
+             report["arms"][arm]["wins"],
+             report["arms"][arm]["losses"])
+            for arm in ARMS
+        )
+        if key != last:
+            print_scoreboard(console, report)
+            last = key
+        await asyncio.sleep(30)
 
 
 def checkpoint(seconds_left: int | None) -> int | None:
@@ -149,6 +338,10 @@ def arm_metrics(signals: list[dict], resolved_market_count: int) -> dict:
 def safe_signal(row: dict) -> dict:
     requested = row.get("jev_requested_ts")
     received = row.get("jev_received_ts")
+    direction = row["signal_direction"]
+    quant_side = side_probability(row.get("quant_p"), direction)
+    jev_side = side_probability(row.get("jev_p"), direction)
+    market_side = side_probability(row.get("market_p"), direction)
     return {
         "slug": row["slug"],
         "checkpoint": row["checkpoint"],
@@ -160,6 +353,11 @@ def safe_signal(row: dict) -> dict:
         "jev_answerable": row.get("jev_answerable"),
         "jev_clarity": row.get("jev_clarity"),
         "market_p": row.get("market_p"),
+        "quant_side_probability": quant_side,
+        "jev_side_probability": jev_side,
+        "market_side_probability": market_side,
+        "quant_minus_market": quant_side - market_side if quant_side is not None and market_side is not None else None,
+        "jev_minus_market": jev_side - market_side if jev_side is not None and market_side is not None else None,
         "jev_latency_seconds": received - requested if requested is not None and received is not None else None,
         "up_won": row.get("up_won"),
     }
@@ -200,7 +398,8 @@ def build_report(store: FastStore, version: str) -> dict:
 
     qualified = [arm for arm in ARMS if arms[arm]["gate"]["passed"]]
     return {
-        "format": REVISION,
+        "format": REPORT_FORMAT,
+        "experiment_revision": REVISION,
         "paper_only": True,
         "orders_created": 0,
         "purpose": "Forward prediction validation before returning to execution research.",
@@ -241,6 +440,13 @@ def build_report(store: FastStore, version: str) -> dict:
             "market": probability_metrics(paired_rows, "market_p"),
         },
         "arms": arms,
+        "edge_diagnostics": {
+            arm: {
+                "quant_minus_market": edge_metrics(selections[arm], "quant_p"),
+                "jev_minus_market": edge_metrics(selections[arm], "jev_p"),
+            }
+            for arm in ARMS
+        },
         "qualified_arms": qualified,
         "prediction_gate_passed": bool(qualified),
         "signals": {arm: [safe_signal(r) for r in selections[arm]] for arm in ARMS},
@@ -306,13 +512,13 @@ class ForwardRunner(FastRunner):
             return
 
         qdir = quant_direction(quant_p)
-        market_text = "—" if cand.book.midpoint is None else f"{cand.book.midpoint:.3f}"
-        self.console.print(
-            f"checkpoint T-{recorded_cp}s | {slug} | Quant={quant_p:.3f} | "
-            f"Market={market_text} | "
-            f"{'请求Jev确认' if qdir else 'Quant未到92%，不调用Jev'}",
-            markup=False,
-        )
+        display_row = {
+            "slug": slug,
+            "checkpoint": recorded_cp,
+            "quant_p": quant_p,
+            "market_p": cand.book.midpoint,
+        }
+        print_checkpoint_panel(self.console, display_row)
         if qdir is None:
             self.store.mark_jev(observation_id, "not_eligible_quant")
         else:
@@ -371,12 +577,19 @@ async def run_forward(s, console: Console, *, version: str, interval: float, sec
                 asyncio.create_task(watch_chainlink_anchors(s, store), name="chainlink"),
                 asyncio.create_task(shadow.work(), name="jev-shadow"),
                 asyncio.create_task(settlement_worker(settlement, s, store, version), name="settlement"),
+                asyncio.create_task(jev_display_worker(store, version, console), name="jev-display"),
+                asyncio.create_task(dashboard_worker(store, version, console), name="dashboard"),
             ]
-            console.print(
-                f"{REVISION} | BTC 5m | checkpoint={CHECKPOINTS} | Quant>=92%才调用Jev | "
-                "不生成模拟订单，不连接真实账户",
-                markup=False,
-            )
+            console.print(Panel(
+                "[bold]BTC 5m 前向预测验证[/]\n"
+                f"Checkpoint: {CHECKPOINTS}\n"
+                "Quant高置信阈值: 92%\n"
+                "Jev: 仅高置信checkpoint异步确认\n"
+                "[bold green]无模拟订单 · 无真实账户 · 只验证预测[/]",
+                title=f"[bold cyan] {REVISION} [/]",
+                border_style="cyan",
+                expand=False,
+            ))
             clock = asyncio.get_running_loop().time
             deadline = clock()
             stop_at = clock() + seconds
@@ -423,11 +636,34 @@ def write_report(report: dict, out: Path) -> None:
         json.dump(report, handle, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
 
 
+
+def resolve_run_paths(db_arg: Path | None, resume_db: Path | None, out_arg: Path | None,
+                      stamp: str) -> tuple[Path, Path, bool]:
+    if db_arg is not None and resume_db is not None:
+        raise ValueError("cannot_use_db_and_resume_db_together")
+    if resume_db is not None:
+        db = Path(resume_db)
+        if not db.is_file():
+            raise ValueError("resume_database_not_found")
+        out = run_output_path(out_arg, f"v7_checkpoint_jev_forward_resume_{stamp}.json.gz")
+        if out.exists():
+            raise FileExistsError("report_already_exists")
+        return db, out, True
+
+    db = run_output_path(db_arg, f"jevymarket.forward-jev_{stamp}.db")
+    out = run_output_path(out_arg, f"v7_checkpoint_jev_forward_{stamp}.json.gz")
+    if db.exists() or out.exists():
+        raise FileExistsError("experiment_output_already_exists")
+    return db, out, False
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description="BTC5m checkpoint + Jev 前向预测实验；无订单")
     parser.add_argument("--seconds", type=int, default=21600)
     parser.add_argument("--loop", type=float, default=INTERVAL_SECONDS)
-    parser.add_argument("--db", type=Path)
+    paths = parser.add_mutually_exclusive_group()
+    paths.add_argument("--db", type=Path, help="新实验数据库路径；默认runs/")
+    paths.add_argument("--resume-db", type=Path, help="续跑已有v7数据库并累计统计")
     parser.add_argument("--out", type=Path)
     args = parser.parse_args(argv)
     if not 1800 <= args.seconds <= 86400:
@@ -436,10 +672,10 @@ def main(argv=None):
         parser.error("本实验固定10秒节拍，避免同时改变采样频率")
 
     stamp = datetime.now(timezone(timedelta(hours=8))).strftime("%Y%m%d_%H%M%S_%f")
-    db = run_output_path(args.db, f"jevymarket.forward-jev_{stamp}.db")
-    out = run_output_path(args.out, f"v7_checkpoint_jev_forward_{stamp}.json.gz")
-    if db.exists() or out.exists():
-        parser.error("实验输出已存在，拒绝覆盖")
+    try:
+        db, out, resumed = resolve_run_paths(args.db, args.resume_db, args.out, stamp)
+    except (ValueError, FileExistsError) as exc:
+        parser.error(str(exc))
 
     s = fast_settings().model_copy(update={"db_path": str(db), "strategy_version": REVISION})
     console = Console()
@@ -456,13 +692,17 @@ def main(argv=None):
     finally:
         store.close()
     report["settlements_added_at_export"] = settled
+    report["resumed_existing_database"] = resumed
     write_report(report, out)
-    console.print(json.dumps({
-        "coverage": report["coverage"],
-        "arms": report["arms"],
-        "qualified_arms": report["qualified_arms"],
-    }, ensure_ascii=False, indent=2), markup=False)
-    console.print(f"已导出 → {out.resolve()}\n数据库 → {db.resolve()}", markup=False)
+    print_scoreboard(console, report, final=True)
+    console.print(Panel(
+        f"报告：[bold]{out.resolve()}[/]\n"
+        f"数据库：[bold]{db.resolve()}[/]\n"
+        f"模式：{'续跑累计' if resumed else '新实验'}",
+        title="[bold green] 已导出 [/]",
+        border_style="green",
+        expand=False,
+    ))
 
 
 if __name__ == "__main__":

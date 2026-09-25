@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 
 import pytest
 
@@ -10,9 +11,13 @@ from jevymarket.checkpoint_jev_forward import (
     arm_metrics,
     build_report,
     checkpoint,
+    directional_edge,
+    edge_metrics,
     first_signals,
     probability_direction,
     quant_direction,
+    resolve_run_paths,
+    side_probability,
     wilson_95,
 )
 from jevymarket.fast_store import FastStore
@@ -92,6 +97,40 @@ def test_first_signal_is_one_independent_market_only():
         ("m1", 120, "UP"),
         ("m2", 90, "DOWN"),
     ]
+
+
+
+def test_directional_edge_uses_probability_of_predicted_side():
+    up = row("up", 1, 120, quant=.96, jev=.80, market=.70) | {"signal_direction": "UP"}
+    down = row("down", 2, 120, quant=.04, jev=.20, market=.30) | {"signal_direction": "DOWN"}
+    assert side_probability(.96, "UP") == .96
+    assert side_probability(.04, "DOWN") == .96
+    assert directional_edge(up) == pytest.approx(.26)
+    assert directional_edge(down) == pytest.approx(.26)
+    metrics = edge_metrics([up, down])
+    assert metrics["n"] == 2
+    assert metrics["positive_fraction"] == 1
+    assert metrics["median"] == pytest.approx(.26)
+
+
+def test_resume_paths_keep_existing_database_and_create_new_report(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    db = tmp_path / "runs" / "old.db"
+    db.parent.mkdir()
+    db.write_bytes(b"existing")
+    resolved_db, out, resumed = resolve_run_paths(None, db, None, "STAMP")
+    assert resolved_db == db
+    assert resumed is True
+    assert out == Path("runs") / "v7_checkpoint_jev_forward_resume_STAMP.json.gz"
+    assert not out.exists()
+
+
+def test_new_paths_refuse_existing_database(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    db = tmp_path / "new.db"
+    db.write_bytes(b"existing")
+    with pytest.raises(FileExistsError):
+        resolve_run_paths(db, None, None, "STAMP")
 
 
 def test_arm_metrics_gate_needs_50_and_strictly_over_65_percent():
@@ -186,6 +225,11 @@ def test_build_report_uses_same_forward_rows_and_exports_no_raw_jev(tmp_path):
         assert report["arms"]["B_quant_jev"]["wins"] == 2
         assert report["arms"]["C_quant_jev_market"]["wins"] == 2
         assert report["coverage"]["jev_success"] == 2
+        assert report["edge_diagnostics"]["A_quant"]["quant_minus_market"]["positive"] == 2
+        first = report["signals"]["A_quant"][0]
+        assert first["quant_side_probability"] == pytest.approx(.96)
+        assert first["market_side_probability"] == pytest.approx(.70)
+        assert first["quant_minus_market"] == pytest.approx(.26)
         encoded = json.dumps(report)
         assert "private_raw_payload" not in encoded
         assert "secret_should_not_export" not in encoded
