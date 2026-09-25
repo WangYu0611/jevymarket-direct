@@ -401,7 +401,18 @@ async def run_live(seconds: int, db: Path, report: dict, client: AsyncSecureClie
                 report["termination"] = "no_candidate"
             else:
                 report["candidate_seen"] = asdict(candidate)
-                await execute_one(client, runtime, candidate, report)
+                try:
+                    positions = await client.list_positions(
+                        user=str(client.wallet), market=[candidate.condition], status="OPEN"
+                    ).first_page()
+                except Exception as exc:
+                    report["termination"] = "market_position_check_failed"
+                    report["position_check_error"] = safe_error(exc)
+                else:
+                    if positions.items:
+                        report["termination"] = "refuse_existing_market_position"
+                    else:
+                        await execute_one(client, runtime, candidate, report)
         finally:
             runtime.stopped = True
             runtime.signal()
@@ -460,8 +471,13 @@ async def async_main(args) -> dict:
 
         db = run_output_path(args.db, args.db_name)
         if db.exists():
-            raise FileExistsError("live canary database already exists")
-        await run_live(args.seconds, db, report, client)
+            report["termination"] = "refuse_existing_database"
+            return report
+        try:
+            await run_live(args.seconds, db, report, client)
+        except Exception as exc:
+            report["termination"] = "live_run_exception"
+            report["live_error"] = safe_error(exc)
         report["db_filename"] = db.name
         return report
     finally:
