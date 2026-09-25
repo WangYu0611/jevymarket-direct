@@ -125,7 +125,7 @@ def aggregate(samples: list[dict]) -> dict:
     per_market = {name: defaultdict(list) for name in ARM_SPECS}
     candidates = {name: set() for name in ARM_SPECS}
     for row in samples:
-        for name, spec in ARM_SPECS.items():
+        for name in ARM_SPECS:
             arm = row["arms"].get(name, {})
             if not arm.get("active"):
                 continue
