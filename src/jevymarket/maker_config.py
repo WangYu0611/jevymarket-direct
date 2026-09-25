@@ -50,8 +50,8 @@ class MakerConfig:
             raise ValueError("确定性阈值必须在0.5与1之间")
         if not 0 < self.min_price < self.max_price < 1:
             raise ValueError("挂价区间无效")
-        if not self.cancel_before_end_seconds < self.entry_seconds <= 30:
-            raise ValueError("本实验只支持结束前最多30秒入场，必须留出撤单时间")
+        if not self.cancel_before_end_seconds < self.entry_seconds <= 60:
+            raise ValueError("本实验只支持结束前最多60秒入场，必须留出撤单时间")
         if self.watchdog_seconds > self.reaction_budget_seconds:
             raise ValueError("看门狗间隔不能大于本地反应预算")
         if not self.paper_cancel_latency_seconds < self.cancel_before_end_seconds:
