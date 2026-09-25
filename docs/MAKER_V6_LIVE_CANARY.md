@@ -36,11 +36,17 @@ Preflight only:
 uv run --frozen python -m jevymarket.maker_live_canary --check-only
 ```
 
-A real-money canary is intentionally not the default. Only after preflight is clean:
+A real-money canary is intentionally not the default. It is additionally hard-gated by a qualifying
+paper report: at least 50 settled filled markets, win rate strictly above 65%, positive PnL,
+positive PnL after removing the three largest wins, zero uncertain orders and zero pending fills.
+
+Only after that paper gate and account preflight are clean:
 
 ```powershell
-uv run --frozen python -m jevymarket.maker_live_canary --live-one --confirm ONE_REAL_POST_ONLY_ORDER --seconds 900
+uv run --frozen python -m jevymarket.maker_live_canary --live-one --confirm ONE_REAL_POST_ONLY_ORDER --paper-report runs/<qualified-paper-report>.json.gz --seconds 900
 ```
+
+Without a passing `--paper-report`, live mode exits before it connects to the authenticated account.
 
 Only run live mode where your account and jurisdiction are permitted to trade. Do not bypass platform or regional restrictions.
 
