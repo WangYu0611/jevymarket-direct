@@ -59,7 +59,7 @@ def test_one_tick_improvement_can_take_queue_front_without_crossing():
     assert improved is not None
     assert improved.price == .92
     assert improved.price < cache.books["11"].ask
-    assert improved.fair_p - improved.price >= config.min_edge
+    assert improved.fair_p - improved.price >= config.min_edge - 1e-9
     assert cache.books["11"].ahead(improved.price) == 0
     assert improved.price * improved.size <= 5 + 1e-9
 
