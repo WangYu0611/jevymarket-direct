@@ -159,10 +159,40 @@ def aggregate(samples: list[dict]) -> dict:
         a = slug in candidates["A_late_30_to_10"]
         b = slug in candidates["B_early_60_to_20"]
         matrix["both" if a and b else "A_only" if a else "B_only" if b else "neither"] += 1
+    bands = {
+        "B_60_to_40": lambda left: 40 < left <= 60,
+        "B_40_to_20": lambda left: 20 < left <= 40,
+        "A_30_to_10": lambda left: 10 < left <= 30,
+    }
+    band_summary = {}
+    for label, predicate in bands.items():
+        arm_name = "A_late_30_to_10" if label.startswith("A_") else "B_early_60_to_20"
+        rows = [r for r in samples if predicate(r["seconds_left"]) and r["arms"].get(arm_name, {}).get("active")]
+        candidates_in_band = sum(r["arms"][arm_name].get("candidate") is not None for r in rows)
+        band_summary[label] = {
+            "samples": len(rows),
+            "candidate_samples": candidates_in_band,
+            "candidate_rate": candidates_in_band / len(rows) if rows else None,
+            "reasons": dict(Counter(r["arms"][arm_name].get("reason", "unknown") for r in rows)),
+            "book_gates": dict(Counter(r.get("book_gate", "unknown") for r in rows)),
+        }
+
+    overlap = [r for r in samples
+               if r["arms"].get("A_late_30_to_10", {}).get("active")
+               and r["arms"].get("B_early_60_to_20", {}).get("active")]
+    mismatch = 0
+    for r in overlap:
+        a, b = r["arms"]["A_late_30_to_10"], r["arms"]["B_early_60_to_20"]
+        if a.get("reason") != b.get("reason") or bool(a.get("candidate")) != bool(b.get("candidate")):
+            mismatch += 1
+
     return {
         "arms": summary,
+        "bands": band_summary,
         "paired_complete_markets": len(paired),
         "paired_candidate_matrix": dict(matrix),
+        "overlap_samples": len(overlap),
+        "overlap_decision_mismatches": mismatch,
         "scope": "Same-feed shadow eligibility only; no paper orders, fills, rebates, or profitability claim.",
     }
 
