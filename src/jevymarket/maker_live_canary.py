@@ -14,8 +14,6 @@ import time
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from types import SimpleNamespace
-
 from polymarket import AsyncSecureClient
 from polymarket.models.clob.order_response import AcceptedOrder, RejectedOrder
 from polymarket.streams import UserSpec
@@ -24,7 +22,7 @@ from .config import load_settings
 from .maker import MakerRuntime
 from .maker_config import MakerConfig
 from .maker_diagnostics import diagnostic_report
-from .maker_engine import Market, Quote, choose_quote
+from .maker_engine import Quote, choose_quote
 from .maker_store import MakerStore, single_process
 from .run_paths import run_output_path
 
@@ -215,9 +213,11 @@ async def account_preflight(client: AsyncSecureClient) -> dict:
     return result
 
 
-async def read_user_stream(client, condition: str, order_id_box: dict, events: list, stop: asyncio.Event):
+async def read_user_stream(client, condition: str, order_id_box: dict, events: list,
+                           stop: asyncio.Event, ready: asyncio.Event):
     try:
         async with await client.subscribe(UserSpec(markets=[condition])) as stream:
+            ready.set()
             async for event in stream:
                 if stop.is_set():
                     return
@@ -279,12 +279,23 @@ async def execute_one(client: AsyncSecureClient, runtime: LiveSignalRuntime,
         report["invalid_reason"] = reason
         return
 
-    order_id_box, user_events, stop_stream = {}, [], asyncio.Event()
+    order_id_box, user_events, stop_stream, stream_ready = {}, [], asyncio.Event(), asyncio.Event()
     stream_task = asyncio.create_task(
-        read_user_stream(client, candidate.condition, order_id_box, user_events, stop_stream),
+        read_user_stream(client, candidate.condition, order_id_box, user_events, stop_stream, stream_ready),
         name="live-canary-user-stream",
     )
-    await asyncio.sleep(.05)  # let authenticated subscription start before placement
+    try:
+        await asyncio.wait_for(stream_ready.wait(), 2.0)
+    except TimeoutError:
+        report["termination"] = "user_stream_not_ready"
+        stop_stream.set()
+        stream_task.cancel()
+        await asyncio.gather(stream_task, return_exceptions=True)
+        return
+    if stream_task.done():
+        report["termination"] = "user_stream_stopped_before_submit"
+        await asyncio.gather(stream_task, return_exceptions=True)
+        return
     started_ns = time.perf_counter_ns()
     try:
         response = await client.place_limit_order(
@@ -388,13 +399,15 @@ async def run_live(seconds: int, db: Path, report: dict, client: AsyncSecureClie
                     break
             if candidate is None:
                 report["termination"] = "no_candidate"
-                return
-            report["candidate_seen"] = asdict(candidate)
-            await execute_one(client, runtime, candidate, report)
+            else:
+                report["candidate_seen"] = asdict(candidate)
+                await execute_one(client, runtime, candidate, report)
         finally:
             runtime.stopped = True
             runtime.signal()
-            await asyncio.gather(public_task, return_exceptions=True)
+            results = await asyncio.gather(public_task, return_exceptions=True)
+            if results and isinstance(results[0], BaseException):
+                report["public_runtime_error"] = safe_error(results[0])
     report["diagnostic_summary"] = diagnostic_report(db)["summary"]
 
 
