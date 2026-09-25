@@ -11,3 +11,6 @@ wheels/
 .env
 *.db
 *.db-journal
+
+# Generated research/run artifacts
+/runs/

@@ -16,4 +16,4 @@ Run:
 uv run --frozen python -m jevymarket.maker_window_ab --seconds 1800
 ```
 
-The generated `v6_window_ab_*.json.gz` is the artifact to review. Do not use this experiment as a profitability or fill claim.
+The generated `runs/v6_window_ab_*.json.gz` is the artifact to review; the companion SQLite database is also created under `runs/`. Do not use this experiment as a profitability or fill claim.

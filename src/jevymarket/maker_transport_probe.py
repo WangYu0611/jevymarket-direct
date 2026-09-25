@@ -17,6 +17,8 @@ from urllib.request import getproxies
 
 import httpx
 
+from .run_paths import run_output_path
+
 REVISION = "v6-public-transport-probe-r1"
 BODY_LIMIT = 65536
 SAFE_ERROR_TYPES = (
@@ -144,7 +146,7 @@ def main(argv=None):
     parser.add_argument("--out", type=Path)
     args = parser.parse_args(argv)
     stamp = datetime.now(timezone(timedelta(hours=8))).strftime("%Y%m%d_%H%M%S_%f")
-    out = args.out or Path(f"v6_transport_check_{stamp}.json.gz")
+    out = run_output_path(args.out, f"v6_transport_check_{stamp}.json.gz")
     if not out.name.endswith(".json.gz"):
         parser.error("输出必须以.json.gz结尾")
     out.parent.mkdir(parents=True, exist_ok=True)
