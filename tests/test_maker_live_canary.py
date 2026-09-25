@@ -1,4 +1,5 @@
 import asyncio
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -24,6 +25,38 @@ def test_live_mode_requires_exact_confirmation_before_any_async_work(monkeypatch
     monkeypatch.setattr(canary.asyncio, "run", fail_run)
     with pytest.raises(SystemExit):
         canary.main(["--live-one"])
+    assert not called
+
+
+
+def test_live_mode_requires_passing_paper_report_before_async_work(tmp_path, monkeypatch):
+    report_path = tmp_path / "paper.json"
+    report_path.write_text(json.dumps({
+        "paper_only": True,
+        "statistics": {
+            "settled_filled_markets": 10,
+            "wins_estimated": 8,
+            "losses_estimated": 2,
+            "gross_pnl_estimated": 5,
+            "pnl_minus_top3_positive_contributions": 1,
+            "uncertain_orders": 0,
+            "pending_filled_orders": 0,
+        },
+    }), encoding="utf-8")
+    called = False
+
+    def fail_run(*args, **kwargs):
+        nonlocal called
+        called = True
+        raise AssertionError("async_main must not run before paper gate passes")
+
+    monkeypatch.setattr(canary.asyncio, "run", fail_run)
+    with pytest.raises(SystemExit):
+        canary.main([
+            "--live-one",
+            "--confirm", canary.CONFIRM_PHRASE,
+            "--paper-report", str(report_path),
+        ])
     assert not called
 
 
