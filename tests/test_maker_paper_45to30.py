@@ -1,5 +1,6 @@
 import gzip
 import json
+import sqlite3
 from dataclasses import asdict
 
 from jevymarket.maker_config import MakerConfig
@@ -43,11 +44,20 @@ def test_compact_report_is_readonly_and_contains_no_live_claim(tmp_path):
     import asyncio
     asyncio.run(store.writer())
 
-    before = db.read_bytes()
+    def logical_dump():
+        conn = sqlite3.connect(f"file:{db.resolve().as_posix()}?mode=ro", uri=True)
+        try:
+            return tuple(conn.iterdump())
+        finally:
+            conn.close()
+
+    before = logical_dump()
     out = tmp_path / "report.json.gz"
     report = compact_report(db, out)
-    after = db.read_bytes()
+    after = logical_dump()
 
+    # WAL/checkpoint housekeeping can change physical SQLite file bytes on
+    # Windows even for read-only readers. The invariant is logical DB content.
     assert before == after
     assert report["format"] == REVISION
     assert report["paper_only"] is True
