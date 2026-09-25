@@ -42,7 +42,8 @@ RTDS_WS = "wss://ws-live-data.polymarket.com"
 TOPICS = {"raw": "crypto_prices_chainlink", "twap30": "crypto_prices_twap_thirty", "twap60": "crypto_prices_twap_sixty"}
 DEFAULT_DB = Path("jevymarket.maker-v6.db")
 REASONS = {
-    "outside_entry_window": "观察中，尚未进入最后10秒或已经进入撤单保护区",
+    "outside_entry_window": "观察中，当前不在配置的入场窗口或已经进入撤单保护区",
+    "window_ab_observe_only": "窗口A/B只观察，不生成模拟订单",
     "missing_anchor_or_reference": "等待新窗口的精确目标价/参考行情",
     "history_missing": "原始行情历史不足，继续预热",
     "history_gap": "原始行情有缺口，暂停挂单",
