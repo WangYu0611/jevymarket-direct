@@ -305,9 +305,10 @@ class ForwardRunner(FastRunner):
             return
 
         qdir = quant_direction(quant_p)
+        market_text = "—" if cand.book.midpoint is None else f"{cand.book.midpoint:.3f}"
         self.console.print(
             f"checkpoint T-{recorded_cp}s | {slug} | Quant={quant_p:.3f} | "
-            f"Market={cand.book.midpoint:.3f} | "
+            f"Market={market_text} | "
             f"{'请求Jev确认' if qdir else 'Quant未到92%，不调用Jev'}",
             markup=False,
         )
