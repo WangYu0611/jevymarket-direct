@@ -120,6 +120,7 @@ class EarlyStore(V8Store):
 
 def early_arm_metrics(rows: list[dict]) -> dict:
     metrics = arm_metrics(rows)
+    metrics.pop("checkpoint_distribution", None)
     settled = [r for r in rows if r.get("up_won") is not None]
     slots = Counter(r["checkpoint"] for r in settled)
     metrics["entry_slot_distribution"] = {
@@ -171,6 +172,7 @@ def build_report(store: EarlyStore, version: str) -> dict:
                 for r in observations
             ),
             "jev_success": sum(r.get("jev_status") == "ok" for r in observations),
+            "jev_status_counts": dict(Counter(r.get("jev_status") for r in observations)),
         },
         "arms": arms,
         "rejection_summary": rejection_summary(events),
@@ -245,6 +247,13 @@ def print_rejections(console: Console, report: dict) -> None:
         ) or "—"
         table.add_row(arm, str(r["evaluations"]), str(r["accepted_events"]), reasons)
     console.print(table)
+    statuses = report["coverage"].get("jev_status_counts", {})
+    important = [
+        f"{name}={statuses.get(name, 0)}"
+        for name in ("ok", "busy", "error", "expired", "disabled_auth", "interrupted")
+        if statuses.get(name, 0)
+    ]
+    console.print("[dim]Jev状态：" + (" | ".join(important) if important else "尚无请求") + "[/]")
 
 
 class EarlyRunner(V8Runner):
@@ -378,11 +387,12 @@ class EarlyRunner(V8Runner):
             early_slot=slot,
             read_compute_seconds=time.monotonic() - started,
         )
+        eligible_slot = slot if quant_p is not None and snapshot is not None and snapshot.trade_ready else None
         observation_id, recorded_slot = self.store.record(
             version=self.version, session=self.session, slug=slug,
             condition_id=cand.condition_id if cand else None, ts=observed_ts,
             seconds_left=snapshot.seconds_left if snapshot else approximate_left,
-            checkpoint=slot, quant_p=quant_p,
+            checkpoint=eligible_slot, quant_p=quant_p,
             market_p=cand.book.midpoint if cand else None,
             yes_ask=cand.book.yes_ask if cand else None,
             no_ask=cand.book.no_ask if cand else None,
