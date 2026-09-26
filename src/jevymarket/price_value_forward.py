@@ -34,8 +34,8 @@ from .fast_store import FastStore
 from .fast_strategy import fast_settings, local_snapshot, next_deadline, snapshot_payload
 from .jev import JevClient, JevError
 from .market_data import watch_chainlink_anchors
-from .markets import build_state
-from .network import ReadUnavailable
+from .markets import Candidate, build_state, fetch_book, market_is_current, passes_static_filters
+from .network import ReadUnavailable, read_with_retry
 from .run_paths import run_output_path
 from .signal import Book, JevView, ask_jev, quantitative_up_probability
 
@@ -517,9 +517,32 @@ class V8JevWorker:
 
 
 class V8Runner(FastRunner):
-    def __init__(self, *args, fee_rate: float, **kwargs):
+    def __init__(self, *args, fee_rate: float, confirm_public: AsyncPublicClient, **kwargs):
         super().__init__(*args, **kwargs)
         self.fee_rate = fee_rate
+        self.confirm_public = confirm_public
+
+    async def confirmation_read(self, slug: str) -> Candidate:
+        market = await read_with_retry(
+            lambda: self.confirm_public.get_market(slug=slug),
+            label="V8 Jev响应后市场读取",
+            attempts=2,
+            timeout_seconds=4,
+        )
+        if market.slug != slug:
+            raise ReadUnavailable("V8确认读取返回不同市场")
+        reason = passes_static_filters(market, self.s)
+        if reason:
+            raise ReadUnavailable(f"V8确认市场不可分析：{reason}")
+        book = await read_with_retry(
+            lambda: fetch_book(self.confirm_public, market),
+            label="V8 Jev响应后盘口读取",
+            attempts=2,
+            timeout_seconds=6,
+        )
+        if not market_is_current(market, self.s):
+            raise ReadUnavailable("V8确认读取期间市场已结束")
+        return Candidate(market=market, book=book)
 
     async def on_jev_result(self, observation_id: int, slug: str, cp: int, original_direction: str,
                             view: JevView, received: float) -> None:
@@ -540,7 +563,7 @@ class V8Runner(FastRunner):
             ))
             return
         try:
-            cand = await self.read(slug)
+            cand = await self.confirmation_read(slug)
             fresh = local_snapshot(cand, self.s, self.store)
             fresh_quant = quantitative_up_probability(fresh)
         except (ReadUnavailable, ValueError, TimeoutError):
@@ -557,7 +580,7 @@ class V8Runner(FastRunner):
             inserted_b = self.store.record_value_trade(
                 version=self.version, arm="B_quant_jev_taker", slug=slug,
                 checkpoint_value=cp, observation_id=observation_id,
-                signal_ts=fresh.captured_at.timestamp(), decision_ts=received,
+                signal_ts=fresh.captured_at.timestamp(), decision_ts=time.time(),
                 quant_p=fresh_quant, jev=view, market_mid=cand.book.midpoint,
                 decision=decision_b, fee_rate=self.fee_rate,
             )
@@ -574,7 +597,7 @@ class V8Runner(FastRunner):
             inserted_c = self.store.record_value_trade(
                 version=self.version, arm="C_jev_value", slug=slug,
                 checkpoint_value=cp, observation_id=observation_id,
-                signal_ts=fresh.captured_at.timestamp(), decision_ts=received,
+                signal_ts=fresh.captured_at.timestamp(), decision_ts=time.time(),
                 quant_p=fresh_quant, jev=view, market_mid=cand.book.midpoint,
                 decision=decision_c, fee_rate=self.fee_rate,
             )
@@ -702,6 +725,7 @@ async def run_v8(settings, console: Console, *, version: str, interval: float,
         store.ensure_experiment(version, experiment_parameters(settings, interval, fee_rate))
         async with AsyncExitStack() as stack:
             public = await stack.enter_async_context(AsyncPublicClient())
+            confirm_public = await stack.enter_async_context(AsyncPublicClient())
             settlement = await stack.enter_async_context(AsyncPublicClient())
             jev = await stack.enter_async_context(JevClient(
                 settings.typesafe_api_key, model=settings.jev_model,
@@ -712,6 +736,7 @@ async def run_v8(settings, console: Console, *, version: str, interval: float,
             runner = V8Runner(
                 settings, store, public, shadow, console,
                 version=version, session=uuid.uuid4().hex, fee_rate=fee_rate,
+                confirm_public=confirm_public,
             )
             shadow.on_result = runner.on_jev_result
             tasks = [
