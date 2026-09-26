@@ -4,9 +4,9 @@ from types import SimpleNamespace
 import pytest
 
 from jevymarket.price_value_early_forward import (
+    EARLY_END_SECONDS,
     EARLY_SLOTS,
     EARLY_START_SECONDS,
-    EARLY_END_SECONDS,
     REVISION,
     EarlyStore,
     build_report,
