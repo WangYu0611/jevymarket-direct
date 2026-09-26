@@ -11,7 +11,6 @@ import argparse
 import asyncio
 import gzip
 import json
-import math
 import time
 import uuid
 from collections import Counter
