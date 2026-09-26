@@ -151,10 +151,9 @@ def test_jev_quality_gate_is_unchanged():
     assert not jev_quality(view(clarity=1), s)
 
 
-def sample_trade(i: int, *, won=True, ask=.70, edge=.20, arm="A_quant_taker"):
+def sample_trade(i: int, *, won=True, ask=.70, edge=.20, arm="A_quant_taker", size=7.14):
     direction = "UP"
     up_won = 1 if won else 0
-    size = 7.14
     fee = taker_fee_usd(size, ask)
     return {
         "id": i,
@@ -203,8 +202,8 @@ def test_profit_gate_needs_50_positive_net_and_stress():
 
 
 def test_top3_concentration_guard_can_fail_even_with_positive_total():
-    rows = [sample_trade(i, won=False, ask=.90) for i in range(47)]
-    rows += [sample_trade(100 + i, won=True, ask=.10) for i in range(3)]
+    rows = [sample_trade(i, won=False, ask=.90, size=.10) for i in range(47)]
+    rows += [sample_trade(100 + i, won=True, ask=.10, size=7.14) for i in range(3)]
     metrics = arm_metrics(rows)
     assert metrics["net_pnl_estimated"] > 0
     assert metrics["net_pnl_minus_top3_positive_contributions"] < 0
