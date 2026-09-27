@@ -256,6 +256,13 @@ def print_rejections(console: Console, report: dict) -> None:
 
 
 class EarlyRunner(V8Runner):
+    async def after_b_value_decision(
+        self, *, observation_id: int, slug: str, slot: int, original_direction: str,
+        view: JevView, fresh_quant: float, cand, fresh, decision, reason: str,
+    ) -> None:
+        """Optional hook for live canary subclasses. Paper runner intentionally does nothing."""
+        return None
+
     async def on_jev_result(
         self, observation_id: int, slug: str, slot: int,
         original_direction: str, view: JevView, received: float,
@@ -319,6 +326,18 @@ class EarlyRunner(V8Runner):
             self.console, arm="B_quant_jev_taker", slug=slug, cp=slot,
             decision=decision_b, reason=reason_b, quant_p=fresh_quant,
             jev=view, inserted=inserted_b,
+        )
+        await self.after_b_value_decision(
+            observation_id=observation_id,
+            slug=slug,
+            slot=slot,
+            original_direction=original_direction,
+            view=view,
+            fresh_quant=fresh_quant,
+            cand=cand,
+            fresh=fresh,
+            decision=decision_b,
+            reason=reason_b,
         )
 
         decision_c, reason_c = value_decision(
