@@ -399,12 +399,17 @@ class LiveT120Runner(EarlyRunner):
 
             await asyncio.sleep(.75)
             matched = float((state or {}).get("size_matched") or 0)
-            final_state = "filled" if matched > 0 else "no_fill"
+            immediate_trade_ids = [str(x) for x in (response.trade_ids or ())]
+            stream_fill = any(row.get("type") == "trade" for row in user_events)
+            final_state = "filled" if matched > 0 or immediate_trade_ids or stream_fill else "no_fill"
             store.update_live(
                 slug,
                 final_state,
                 order_state_json=json.dumps(state) if state else None,
-                user_events_json=json.dumps(user_events),
+                user_events_json=json.dumps({
+                    "events": user_events,
+                    "immediate_trade_ids": immediate_trade_ids,
+                }),
                 error_json=json.dumps(settle_error) if settle_error else None,
             )
             self.console.print(Panel(
