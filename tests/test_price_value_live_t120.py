@@ -10,23 +10,55 @@ from jevymarket.price_value_forward import ValueDecision
 from jevymarket.signal import JevView
 
 
-def make_report(tmp_path, *, gate_passed=False):
+def paper_trade(i, *, won=True):
+    ask = .70
+    size = 7.14
+    return {
+        "arm": "B_quant_jev_taker",
+        "slug": f"m{i}",
+        "checkpoint": 120,
+        "signal_ts": i,
+        "decision_ts": i + .1,
+        "direction": "UP",
+        "quant_p": .95,
+        "jev_p": .84,
+        "jev_answerable": .9,
+        "jev_clarity": 3,
+        "market_mid": .695,
+        "bid": .69,
+        "ask": ask,
+        "spread": .01,
+        "depth_5c_usd": 100,
+        "tick_size": .01,
+        "min_order_size": 5,
+        "edge_probability": .95,
+        "edge": .25,
+        "size": size,
+        "notional_usd": size * ask,
+        "taker_fee_rate": .07,
+        "taker_fee_usd_est": 0,
+        "up_won": int(won),
+    }
+
+
+def make_report(tmp_path, *, t120_count=23):
+    wins = 20 if t120_count == 23 else 45
+    rows = [paper_trade(i, won=i < wins) for i in range(t120_count)]
     payload = {
         "format": "v8.1-early-window-value-report-r1",
         "arms": {
             "B_quant_jev_taker": {
-                "trades": 31,
-                "settled": 31,
-                "wins": 25,
-                "losses": 6,
-                "win_rate": 25 / 31,
-                "net_pnl_estimated": 9.95,
-                "net_roi_estimated": .064,
-                "net_pnl_minus_top3_positive_contributions": -6.67,
-                "stress_plus_1tick": {"net_pnl_estimated": 7.84},
-                "gate": {"passed": gate_passed},
+                "trades": t120_count,
+                "settled": t120_count,
+                "wins": wins,
+                "losses": t120_count - wins,
+                "win_rate": wins / t120_count,
+                "net_pnl_estimated": 1.0,
+                "net_roi_estimated": .01,
+                "net_pnl_minus_top3_positive_contributions": 1.0,
             }
         },
+        "trades": {"B_quant_jev_taker": rows},
     }
     path = tmp_path / "paper.json.gz"
     with gzip.open(path, "wt", encoding="utf-8") as handle:
@@ -64,15 +96,15 @@ def view():
     )
 
 
-def test_current_v81_is_canary_ready_but_not_session_ready(tmp_path):
-    gate = live.evaluate_live_gate(make_report(tmp_path, gate_passed=False))
+def test_current_v81_t120_is_canary_ready_but_not_session_ready(tmp_path):
+    gate = live.evaluate_live_gate(make_report(tmp_path, t120_count=23))
     assert gate["canary_ready"]
     assert not gate["session_ready"]
-    assert gate["paper_b"]["settled"] == 31
+    assert gate["paper_b_t120"]["settled"] == 23
 
 
-def test_session_requires_full_paper_gate(tmp_path):
-    gate = live.evaluate_live_gate(make_report(tmp_path, gate_passed=True))
+def test_session_requires_full_t120_paper_gate(tmp_path):
+    gate = live.evaluate_live_gate(make_report(tmp_path, t120_count=50))
     assert gate["canary_ready"]
     assert gate["session_ready"]
 
