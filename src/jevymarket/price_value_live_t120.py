@@ -51,7 +51,14 @@ from .price_value_early_forward import (
 from .price_value_early_forward import (
     build_report as build_paper_report,
 )
-from .price_value_forward import CRYPTO_TAKER_FEE_RATE, ValueDecision, jev_quality, quant_direction, value_decision
+from .price_value_forward import (
+    CRYPTO_TAKER_FEE_RATE,
+    ValueDecision,
+    arm_metrics,
+    jev_quality,
+    quant_direction,
+    value_decision,
+)
 from .run_paths import run_output_path
 from .signal import JevView, quantitative_up_probability
 
@@ -97,32 +104,45 @@ def load_json_gz(path: Path) -> dict:
 
 def evaluate_live_gate(path: Path) -> dict:
     report = load_json_gz(path)
-    arm = report.get("arms", {}).get("B_quant_jev_taker", {})
+    overall = report.get("arms", {}).get("B_quant_jev_taker", {})
+    t120_rows = [
+        row for row in report.get("trades", {}).get("B_quant_jev_taker", [])
+        if row.get("checkpoint") == LIVE_SLOT
+    ]
+    t120 = arm_metrics(t120_rows)
     checks = {
         "v81_report": str(report.get("format", "")).startswith("v8.1-early-window-value"),
-        "settled_at_least_30": int(arm.get("settled", 0)) >= 30,
-        "win_rate_over_65pct": (arm.get("win_rate") or 0) > .65,
-        "positive_net_pnl": (arm.get("net_pnl_estimated") or 0) > 0,
-        "positive_after_1tick_stress": (
-            arm.get("stress_plus_1tick", {}).get("net_pnl_estimated") or 0
+        "t120_settled_at_least_20": int(t120.get("settled", 0)) >= 20,
+        "t120_win_rate_over_65pct": (t120.get("win_rate") or 0) > .65,
+        "t120_positive_net_pnl": (t120.get("net_pnl_estimated") or 0) > 0,
+        "t120_positive_after_1tick_stress": (
+            t120.get("stress_plus_1tick", {}).get("net_pnl_estimated") or 0
         ) > 0,
     }
     canary_ready = all(checks.values())
-    session_ready = canary_ready and bool(arm.get("gate", {}).get("passed"))
+    session_ready = canary_ready and bool(t120.get("gate", {}).get("passed"))
     return {
         "canary_ready": canary_ready,
         "session_ready": session_ready,
         "checks": checks,
-        "paper_b": {
-            k: arm.get(k)
+        "paper_b_overall": {
+            k: overall.get(k)
             for k in (
                 "trades", "settled", "wins", "losses", "win_rate",
                 "net_pnl_estimated", "net_roi_estimated",
                 "net_pnl_minus_top3_positive_contributions",
             )
         },
+        "paper_b_t120": {
+            k: t120.get(k)
+            for k in (
+                "trades", "settled", "wins", "losses", "win_rate",
+                "net_pnl_estimated", "net_roi_estimated",
+                "net_pnl_minus_top3_positive_contributions",
+                "stress_plus_1tick", "gate",
+            )
+        },
     }
-
 
 async def geoblock_check() -> dict:
     """Fail closed; never expose the returned IP in reports."""
