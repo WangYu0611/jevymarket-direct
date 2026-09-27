@@ -12,7 +12,6 @@ import argparse
 import asyncio
 import gzip
 import json
-import math
 import time
 import uuid
 from contextlib import AsyncExitStack
@@ -26,7 +25,6 @@ from rich.console import Console
 from rich.panel import Panel
 
 from .config import load_settings
-from .fast_cli import single_instance
 from .fast_runner import settlement_worker
 from .fast_strategy import fast_settings, local_snapshot, next_deadline
 from .jev import JevClient
@@ -41,12 +39,16 @@ from .maker_live_canary import (
 from .market_data import watch_chainlink_anchors
 from .price_value_early_forward import (
     INTERVAL_SECONDS,
-    REVISION as PAPER_REVISION,
     EarlyRunner,
     EarlyStore,
-    build_report as build_paper_report,
     print_rejections,
     print_scoreboard,
+)
+from .price_value_early_forward import (
+    REVISION as PAPER_REVISION,
+)
+from .price_value_early_forward import (
+    build_report as build_paper_report,
 )
 from .price_value_forward import CRYPTO_TAKER_FEE_RATE, ValueDecision, jev_quality, quant_direction, value_decision
 from .run_paths import run_output_path
