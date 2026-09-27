@@ -25,6 +25,7 @@ from rich.console import Console
 from rich.panel import Panel
 
 from .config import load_settings
+from .fast_cli import single_instance
 from .fast_runner import settlement_worker
 from .fast_strategy import fast_settings, local_snapshot, next_deadline
 from .jev import JevClient
@@ -259,7 +260,7 @@ class LiveT120Runner(EarlyRunner):
         return True, "ok"
 
     async def _place_fak(
-        self, *, slug: str, condition_id: str, token_id: str,
+        self, *, slug: str, condition_id: str,
         direction: str, quant_p: float, view: JevView,
         decision: ValueDecision,
     ) -> None:
@@ -285,13 +286,6 @@ class LiveT120Runner(EarlyRunner):
                 self.live_halted = True
             return
 
-        if not store.reserve_live_intent(
-            slug=slug, condition_id=condition_id, token_id=token_id,
-            direction=direction, quant_p=quant_p, jev_p=view.p_yes,
-            ask=decision.ask, edge=decision.edge, notional=decision.notional_usd,
-        ):
-            return
-
         order_box: dict[str, str] = {}
         user_events: list[dict] = []
         stop_stream, stream_ready = asyncio.Event(), asyncio.Event()
@@ -306,16 +300,18 @@ class LiveT120Runner(EarlyRunner):
             try:
                 await asyncio.wait_for(stream_ready.wait(), 2.0)
             except TimeoutError:
-                store.update_live(
-                    slug, "rejected",
-                    error_json=json.dumps({"reason": "user_stream_not_ready"}),
-                )
+                self.console.print(Panel(
+                    f"{slug}\n[bold yellow]REAL SKIP[/] · user_stream_not_ready",
+                    title="[bold yellow] T120 LIVE PRE-SUBMIT [/]",
+                    border_style="yellow", expand=False,
+                ))
                 return
             if stream_task.done():
-                store.update_live(
-                    slug, "rejected",
-                    error_json=json.dumps({"reason": "user_stream_stopped"}),
-                )
+                self.console.print(Panel(
+                    f"{slug}\n[bold yellow]REAL SKIP[/] · user_stream_stopped",
+                    title="[bold yellow] T120 LIVE PRE-SUBMIT [/]",
+                    border_style="yellow", expand=False,
+                ))
                 return
 
             # Final public refresh after the private stream is ready.
@@ -324,43 +320,54 @@ class LiveT120Runner(EarlyRunner):
                 fresh = local_snapshot(cand, self.s, self.store)
                 fresh_quant = quantitative_up_probability(fresh)
             except Exception as exc:
-                store.update_live(
-                    slug, "rejected",
-                    error_json=json.dumps({
-                        "reason": "final_public_refresh_failed",
-                        "error": safe_error(exc),
-                    }),
-                )
+                self.console.print(Panel(
+                    f"{slug}\n[bold yellow]REAL SKIP[/] · final_public_refresh_failed · "
+                    f"{safe_error(exc)['classes'][0]}",
+                    title="[bold yellow] T120 LIVE PRE-SUBMIT [/]",
+                    border_style="yellow", expand=False,
+                ))
                 return
 
             fresh_direction = quant_direction(fresh_quant)
             if fresh_quant is None or fresh_direction != direction:
-                store.update_live(
-                    slug, "rejected",
-                    error_json=json.dumps({"reason": "final_quant_invalidated"}),
-                )
+                self.console.print(Panel(
+                    f"{slug}\n[bold yellow]REAL SKIP[/] · final_quant_invalidated",
+                    title="[bold yellow] T120 LIVE PRE-SUBMIT [/]",
+                    border_style="yellow", expand=False,
+                ))
                 return
             if not jev_quality(view, self.s):
-                store.update_live(
-                    slug, "rejected",
-                    error_json=json.dumps({"reason": "final_jev_quality_failed"}),
-                )
+                self.console.print(Panel(
+                    f"{slug}\n[bold yellow]REAL SKIP[/] · final_jev_quality_failed",
+                    title="[bold yellow] T120 LIVE PRE-SUBMIT [/]",
+                    border_style="yellow", expand=False,
+                ))
                 return
 
             fresh_decision, fresh_reason = value_decision(
                 fresh_quant, fresh_direction, cand.book, self.s, fee_rate=self.fee_rate
             )
             if fresh_decision is None:
-                store.update_live(
-                    slug, "rejected",
-                    error_json=json.dumps({
-                        "reason": "final_value_invalidated",
-                        "detail": fresh_reason,
-                    }),
-                )
+                self.console.print(Panel(
+                    f"{slug}\n[bold yellow]REAL SKIP[/] · final_value_invalidated:{fresh_reason}",
+                    title="[bold yellow] T120 LIVE PRE-SUBMIT [/]",
+                    border_style="yellow", expand=False,
+                ))
                 return
 
             fresh_token = token_for_direction(cand, direction)
+            if not store.reserve_live_intent(
+                slug=slug,
+                condition_id=cand.condition_id,
+                token_id=fresh_token,
+                direction=direction,
+                quant_p=fresh_quant,
+                jev_p=view.p_yes,
+                ask=fresh_decision.ask,
+                edge=fresh_decision.edge,
+                notional=fresh_decision.notional_usd,
+            ):
+                return
             store.update_live(slug, "placing")
             started = time.perf_counter_ns()
             try:
@@ -376,6 +383,8 @@ class LiveT120Runner(EarlyRunner):
                         "error": safe_error(exc),
                     }),
                 )
+                if self.live_mode == "one":
+                    self.live_done.set()
                 return
 
             safe = safe_response(response)
@@ -394,6 +403,8 @@ class LiveT120Runner(EarlyRunner):
                 }),
             )
             if not isinstance(response, AcceptedOrder):
+                if self.live_mode == "one":
+                    self.live_done.set()
                 return
 
             settle_error = None
@@ -451,7 +462,6 @@ class LiveT120Runner(EarlyRunner):
         await self._place_fak(
             slug=slug,
             condition_id=cand.condition_id,
-            token_id=token_for_direction(cand, original_direction),
             direction=original_direction,
             quant_p=fresh_quant,
             view=view,
@@ -651,6 +661,27 @@ async def async_main(args) -> dict:
         await secure.close()
 
 
+
+def resolve_live_paths(
+    db_arg: Path | None, resume_db: Path | None, out_arg: Path | None, stamp: str,
+) -> tuple[Path, Path, bool]:
+    if db_arg is not None and resume_db is not None:
+        raise ValueError("cannot_use_db_and_resume_db_together")
+    if resume_db is not None:
+        db = Path(resume_db)
+        if not db.is_file():
+            raise ValueError("resume_database_not_found")
+        out = run_output_path(out_arg, f"v81_live_t120_resume_{stamp}.json.gz")
+        if out.exists():
+            raise FileExistsError("report_already_exists")
+        return db, out, True
+    db = run_output_path(db_arg, f"jevymarket.v81-live-t120_{stamp}.db")
+    out = run_output_path(out_arg, f"v81_live_t120_{stamp}.json.gz")
+    if db.exists() or out.exists():
+        raise FileExistsError("live_output_already_exists")
+    return db, out, False
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(
         description="V8.1 T-120 Quant+Jev+ASK真钱canary；T-110/T-100只记录"
@@ -662,7 +693,9 @@ def main(argv=None):
     parser.add_argument("--confirm", default="")
     parser.add_argument("--paper-report", type=Path, required=True)
     parser.add_argument("--seconds", type=int, default=DEFAULT_SESSION_SECONDS)
-    parser.add_argument("--db", type=Path)
+    paths = parser.add_mutually_exclusive_group()
+    paths.add_argument("--db", type=Path)
+    paths.add_argument("--resume-db", type=Path)
     parser.add_argument("--out", type=Path)
     args = parser.parse_args(argv)
 
@@ -681,12 +714,17 @@ def main(argv=None):
         args.mode = "check"
 
     stamp = datetime.now(timezone(timedelta(hours=8))).strftime("%Y%m%d_%H%M%S_%f")
-    args.db = run_output_path(args.db, f"jevymarket.v81-live-t120_{stamp}.db")
-    out = run_output_path(args.out, f"v81_live_t120_{stamp}.json.gz")
-    if args.db.exists() or out.exists():
-        parser.error("live输出已存在，拒绝覆盖")
+    try:
+        args.db, out, resumed = resolve_live_paths(args.db, args.resume_db, args.out, stamp)
+    except (ValueError, FileExistsError) as exc:
+        parser.error(str(exc))
 
-    result = asyncio.run(async_main(args))
+    if args.check_only:
+        result = asyncio.run(async_main(args))
+    else:
+        with single_instance(str(args.db)):
+            result = asyncio.run(async_main(args))
+    result["resumed_existing_database"] = resumed
     with gzip.open(out, "xt", encoding="utf-8") as handle:
         json.dump(result, handle, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
     print(json.dumps({
