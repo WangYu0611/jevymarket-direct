@@ -195,6 +195,21 @@ class LiveStore(EarlyStore):
         return sum(float(r["planned_notional"]) for r in self.live_rows())
 
 
+
+def market_order_kwargs(token_id: str, decision: ValueDecision) -> dict:
+    """Exact live BUY contract: FAK, no worse than refreshed ask, all-in spend <= USD 5."""
+    if decision.notional_usd <= 0 or decision.notional_usd > MAX_ORDER_USD + 1e-9:
+        raise ValueError("live_notional_exceeds_cap")
+    return {
+        "token_id": token_id,
+        "side": "BUY",
+        "amount": str(decision.notional_usd),
+        "max_spend": str(MAX_ORDER_USD),
+        "max_price": str(decision.ask),
+        "order_type": "FAK",
+    }
+
+
 def token_for_direction(cand, direction: str) -> str:
     return cand.book.yes_token_id if direction == "UP" else cand.book.no_token_id
 
@@ -348,12 +363,7 @@ class LiveT120Runner(EarlyRunner):
             started = time.perf_counter_ns()
             try:
                 response = await self.secure_client.place_market_order(
-                    token_id=fresh_token,
-                    side="BUY",
-                    amount=str(fresh_decision.notional_usd),
-                    max_spend=str(MAX_ORDER_USD),
-                    max_price=str(fresh_decision.ask),
-                    order_type="FAK",
+                    **market_order_kwargs(fresh_token, fresh_decision)
                 )
             except Exception as exc:
                 self.live_halted = True
