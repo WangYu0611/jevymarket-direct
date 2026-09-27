@@ -44,14 +44,15 @@ For a future full live session, hard upper bounds are:
 
 ## Paper gates
 
-`--live-one` is an infrastructure canary. It requires the supplied V8.1 B arm
-to have at least 30 settled simulated trades, >65% win rate, positive estimated
-net PnL, and positive +1-tick price-stress PnL.
+`--live-one` is an infrastructure canary. Because real money is T-120-only, it
+uses the T-120 subset of the supplied V8.1 B arm. It requires at least 20 settled
+T-120 simulated trades, >65% win rate, positive estimated net PnL, and positive
++1-tick price-stress PnL.
 
-`--live-session` is stricter. It additionally requires the complete V8.1 B
-paper gate to pass, including >=50 settled trades and the existing concentration
-guard. A current report that has not passed the full B gate cannot start an
-automated 24-hour live session.
+`--live-session` is stricter. The **T-120 subset itself** must pass the complete
+V8.1 profitability gate: >=50 settled T-120 trades, >65% win rate, positive net
+PnL, positive PnL after removing the three largest winners, and positive +1-tick
+stress PnL. T-110/T-100 results cannot unlock the real session.
 
 ## Geographic compliance
 
@@ -116,3 +117,19 @@ The session cannot exceed 24 real attempts or USD 120 planned notional.
 A placement exception after submission is treated as uncertain and halts all
 further live trading. The operator must review the account before starting a new
 live run.
+
+
+## Resume after a clean stop
+
+Live DBs can be resumed only when every prior live row is terminal
+(`filled`, `no_fill`, or `rejected`). Any unresolved intent/placement state
+fails closed and must be reviewed manually before another live run.
+
+```powershell
+uv run --frozen python -m jevymarket.price_value_live_t120 \
+    --live-one \
+    --confirm ONE_REAL_T120_QUANT_JEV_ASK \
+    --paper-report "runs\v81_early_value_forward_....json.gz" \
+    --resume-db "runs\jevymarket.v81-live-t120_....db" \
+    --seconds 86400
+```
