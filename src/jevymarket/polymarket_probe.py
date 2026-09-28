@@ -14,6 +14,7 @@ import json
 from decimal import Decimal
 
 from polymarket import AsyncPublicClient, AsyncSecureClient
+from polymarket.streams import UserSpec
 
 from .config import load_settings
 from .executor import builder_api_key_from_settings
@@ -112,6 +113,49 @@ async def run_probe(amount: Decimal) -> dict:
             market = await public.get_market(slug=slug)
             book = await fetch_book(public, market)
         direction, asset_id, ask = _side(book)
+        condition_id = str(market.condition_id)
+
+        try:
+            positions_page = await secure.list_positions(
+                user=str(secure.wallet),
+                condition_id=condition_id,
+                status="OPEN",
+            ).first_page()
+            market_positions = len(positions_page.items)
+        except Exception as exc:
+            return {
+                "termination": "position_query_failed",
+                "sdk_contract": sdk,
+                "geoblock": geo,
+                "preflight": preflight,
+                "error": safe_error(exc),
+            }
+
+        try:
+            orders_page = await secure.list_open_orders(
+                market=condition_id
+            ).first_page()
+            market_open_orders = len(orders_page.items)
+        except Exception as exc:
+            return {
+                "termination": "open_order_query_failed",
+                "sdk_contract": sdk,
+                "geoblock": geo,
+                "preflight": preflight,
+                "error": safe_error(exc),
+            }
+
+        try:
+            async with await secure.subscribe(UserSpec(markets=[condition_id])):
+                user_stream_ok = True
+        except Exception as exc:
+            return {
+                "termination": "user_stream_probe_failed",
+                "sdk_contract": sdk,
+                "geoblock": geo,
+                "preflight": preflight,
+                "error": safe_error(exc),
+            }
 
         ten_cent = await _sign(
             secure, asset_id=asset_id, ask=ask, amount=amount
@@ -135,6 +179,13 @@ async def run_probe(amount: Decimal) -> dict:
                 "direction": direction,
                 "ask": ask,
                 "minimum_order_size": float(minimum),
+            },
+            "guard_probe": {
+                "position_query_ok": True,
+                "market_positions": market_positions,
+                "open_order_query_ok": True,
+                "market_open_orders": market_open_orders,
+                "user_stream_subscribe_ok": user_stream_ok,
             },
             "ten_cent_probe": {
                 "requested_usd": float(amount),
