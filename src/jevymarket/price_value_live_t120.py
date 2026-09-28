@@ -1,7 +1,7 @@
-"""V8.1 T-120 live canary/session.
+"""V8.2 T-120 live canary/session.
 
 Only the B arm (Quant + Jev confirmation + refreshed real ask) can ever place
-real orders, and only in the T-120 slot. T-110/T-100 remain paper-only.
+real orders, and only in the T-120 slot. T-100/C remain shadow-only; T-110 is retired.
 
 Live modes fail closed on Polymarket geoblock, account preflight, stale signal,
 price-value recheck, or uncertain placement state.
@@ -38,19 +38,6 @@ from .maker_live_canary import (
     safe_response,
 )
 from .market_data import watch_chainlink_anchors
-from .price_value_early_forward import (
-    INTERVAL_SECONDS,
-    EarlyRunner,
-    EarlyStore,
-    print_rejections,
-    print_scoreboard,
-)
-from .price_value_early_forward import (
-    REVISION as PAPER_REVISION,
-)
-from .price_value_early_forward import (
-    build_report as build_paper_report,
-)
 from .price_value_forward import (
     CRYPTO_TAKER_FEE_RATE,
     ValueDecision,
@@ -59,10 +46,25 @@ from .price_value_forward import (
     quant_direction,
     value_decision,
 )
+from .price_value_t120_main import (
+    INTERVAL_SECONDS,
+    V82Runner,
+    V82Store,
+    experiment_parameters,
+    print_primary,
+    print_rejections,
+    print_shadow,
+)
+from .price_value_t120_main import (
+    REVISION as PAPER_REVISION,
+)
+from .price_value_t120_main import (
+    build_report as build_paper_report,
+)
 from .run_paths import run_output_path
 from .signal import JevView, quantitative_up_probability
 
-REVISION = "v8.1-t120-live-r1"
+REVISION = "v8.2-t120-live-r1"
 CONFIRM_ONE = "ONE_REAL_T120_QUANT_JEV_ASK"
 CONFIRM_SESSION = "LIVE_T120_QUANT_JEV_ASK_SESSION"
 LIVE_SLOT = 120
@@ -72,7 +74,7 @@ MAX_SESSION_NOTIONAL_USD = 120.0
 DEFAULT_SESSION_SECONDS = 86_400
 
 LIVE_SCHEMA = """
-CREATE TABLE IF NOT EXISTS v81_live_orders (
+CREATE TABLE IF NOT EXISTS v82_live_orders (
     id INTEGER PRIMARY KEY,
     slug TEXT NOT NULL UNIQUE,
     slot INTEGER NOT NULL,
@@ -104,14 +106,25 @@ def load_json_gz(path: Path) -> dict:
 
 def evaluate_live_gate(path: Path) -> dict:
     report = load_json_gz(path)
-    overall = report.get("arms", {}).get("B_quant_jev_taker", {})
-    t120_rows = [
-        row for row in report.get("trades", {}).get("B_quant_jev_taker", [])
-        if row.get("checkpoint") == LIVE_SLOT
-    ]
-    t120 = arm_metrics(t120_rows)
+    fmt = str(report.get("format", ""))
+    legacy = fmt.startswith("v8.1-early-window-value")
+    current = fmt.startswith("v8.2-t120-main-shadow")
+
+    if current:
+        t120 = report.get("primary_strategy", {}).get("metrics", {})
+        overall = t120
+    elif legacy:
+        overall = report.get("arms", {}).get("B_quant_jev_taker", {})
+        t120_rows = [
+            row for row in report.get("trades", {}).get("B_quant_jev_taker", [])
+            if row.get("checkpoint") == LIVE_SLOT
+        ]
+        t120 = arm_metrics(t120_rows)
+    else:
+        t120, overall = {}, {}
+
     checks = {
-        "v81_report": str(report.get("format", "")).startswith("v8.1-early-window-value"),
+        "supported_report": legacy or current,
         "t120_settled_at_least_20": int(t120.get("settled", 0)) >= 20,
         "t120_win_rate_over_65pct": (t120.get("win_rate") or 0) > .65,
         "t120_positive_net_pnl": (t120.get("net_pnl_estimated") or 0) > 0,
@@ -125,6 +138,7 @@ def evaluate_live_gate(path: Path) -> dict:
         "canary_ready": canary_ready,
         "session_ready": session_ready,
         "checks": checks,
+        "report_generation": "v8.2" if current else ("v8.1-legacy" if legacy else "unsupported"),
         "paper_b_overall": {
             k: overall.get(k)
             for k in (
@@ -159,14 +173,14 @@ async def geoblock_check() -> dict:
     }
 
 
-class LiveStore(EarlyStore):
+class LiveStore(V82Store):
     def __init__(self, path):
         super().__init__(path)
         self.conn.executescript(LIVE_SCHEMA)
 
     def live_rows(self) -> list[dict]:
         return [dict(r) for r in self.conn.execute(
-            "SELECT * FROM v81_live_orders ORDER BY id"
+            "SELECT * FROM v82_live_orders ORDER BY id"
         ).fetchall()]
 
     def unresolved_live_rows(self) -> list[dict]:
@@ -180,7 +194,7 @@ class LiveStore(EarlyStore):
         now = time.time()
         with self.conn:
             cur = self.conn.execute(
-                """INSERT OR IGNORE INTO v81_live_orders
+                """INSERT OR IGNORE INTO v82_live_orders
                 (slug,slot,created_ts,updated_ts,state,condition_id,token_id,direction,
                  quant_p,jev_p,ask,edge,planned_notional,max_spend)
                 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
@@ -207,7 +221,7 @@ class LiveStore(EarlyStore):
         values.append(slug)
         with self.conn:
             self.conn.execute(
-                f"UPDATE v81_live_orders SET {','.join(assignments)} WHERE slug=?",
+                f"UPDATE v82_live_orders SET {','.join(assignments)} WHERE slug=?",
                 values,
             )
 
@@ -237,7 +251,7 @@ def token_for_direction(cand, direction: str) -> str:
     return cand.book.yes_token_id if direction == "UP" else cand.book.no_token_id
 
 
-class LiveT120Runner(EarlyRunner):
+class LiveT120Runner(V82Runner):
     def __init__(self, *args, secure_client: AsyncSecureClient, live_mode: str, **kwargs):
         super().__init__(*args, **kwargs)
         self.secure_client = secure_client
@@ -314,7 +328,7 @@ class LiveT120Runner(EarlyRunner):
                 self.secure_client, condition_id, order_box,
                 user_events, stop_stream, stream_ready,
             ),
-            name="v81-live-user-stream",
+            name="v82-live-user-stream",
         )
         try:
             try:
@@ -517,7 +531,8 @@ def build_live_report(store: LiveStore, paper_gate: dict, mode: str, geoblock: d
         ],
         "limitations": [
             "Real mode only opens a position when current geoblock says trading is permitted.",
-            "T-110/T-100 are paper-only and can never call the live placement path.",
+            "T-100 and C are shadow-only and can never call the live placement path.",
+            "T-110 is retired from V8.2.",
             "A/C paper arms can never call the live placement path.",
             "FAK max_price prevents fills above the final refreshed ask; max_spend is capped at USD 5.",
             "A placement exception is treated as uncertain and halts additional live trading.",
@@ -535,9 +550,11 @@ async def run(
     tasks = []
     console = Console()
     try:
-        # Reuse the exact V8.1 manifest so paper observations remain directly comparable.
-        from .price_value_early_forward import experiment_parameters
-        store.ensure_experiment(PAPER_REVISION, experiment_parameters(settings, INTERVAL_SECONDS, CRYPTO_TAKER_FEE_RATE))
+        # Reuse the exact V8.2 manifest so live shadow observations remain comparable.
+        store.ensure_experiment(
+            PAPER_REVISION,
+            experiment_parameters(settings, INTERVAL_SECONDS, CRYPTO_TAKER_FEE_RATE),
+        )
 
         async with AsyncExitStack() as stack:
             public = await stack.enter_async_context(AsyncPublicClient())
@@ -572,7 +589,7 @@ async def run(
                 "[bold]REAL-MONEY CANARY[/]\n"
                 "真钱路径：[bold cyan]T-120 ONLY[/]\n"
                 "条件：[bold]Quant + Jev + response-time ASK[/]\n"
-                "T-110/T-100：只记录，不下单\n"
+                "T-100/C：影子记录，不下单；T-110已停用\n"
                 f"单笔总支出硬上限：USD {MAX_ORDER_USD:.2f}\n"
                 f"模式：{mode}",
                 title=f"[bold red] {REVISION} [/]",
@@ -591,7 +608,8 @@ async def run(
                 await runner.tick(budget_seconds=min(8.0, INTERVAL_SECONDS * .8))
                 if clock() >= next_board:
                     paper = build_paper_report(store, PAPER_REVISION)
-                    print_scoreboard(console, paper)
+                    print_primary(console, paper)
+                    print_shadow(console, paper)
                     print_rejections(console, paper)
                     console.print(
                         f"[bold red]REAL attempts={store.live_attempt_count()} "
@@ -691,12 +709,12 @@ def resolve_live_paths(
         db = Path(resume_db)
         if not db.is_file():
             raise ValueError("resume_database_not_found")
-        out = run_output_path(out_arg, f"v81_live_t120_resume_{stamp}.json.gz")
+        out = run_output_path(out_arg, f"v82_live_t120_resume_{stamp}.json.gz")
         if out.exists():
             raise FileExistsError("report_already_exists")
         return db, out, True
-    db = run_output_path(db_arg, f"jevymarket.v81-live-t120_{stamp}.db")
-    out = run_output_path(out_arg, f"v81_live_t120_{stamp}.json.gz")
+    db = run_output_path(db_arg, f"jevymarket.v82-live-t120_{stamp}.db")
+    out = run_output_path(out_arg, f"v82_live_t120_{stamp}.json.gz")
     if db.exists() or out.exists():
         raise FileExistsError("live_output_already_exists")
     return db, out, False
@@ -704,7 +722,7 @@ def resolve_live_paths(
 
 def main(argv=None):
     parser = argparse.ArgumentParser(
-        description="V8.1 T-120 Quant+Jev+ASK真钱canary；T-110/T-100只记录"
+        description="V8.2 T-120 Quant+Jev+最新ASK真钱canary；T-100/C仅影子记录"
     )
     modes = parser.add_mutually_exclusive_group(required=True)
     modes.add_argument("--check-only", action="store_true")
