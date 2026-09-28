@@ -60,6 +60,121 @@ INTERVAL_SECONDS = 10.0
 DEFAULT_SECONDS = 86_400
 PRIMARY_ARM = "B_quant_jev_taker"
 
+V82_SLOT_SCHEMA = """
+CREATE TABLE IF NOT EXISTS v82_slot_trades (
+    id INTEGER PRIMARY KEY,
+    version TEXT NOT NULL,
+    arm TEXT NOT NULL,
+    slug TEXT NOT NULL,
+    slot INTEGER NOT NULL,
+    observation_id INTEGER NOT NULL,
+    signal_ts REAL NOT NULL,
+    decision_ts REAL NOT NULL,
+    direction TEXT NOT NULL,
+    quant_p REAL NOT NULL,
+    jev_p REAL,
+    jev_answerable REAL,
+    jev_clarity INTEGER,
+    market_mid REAL,
+    bid REAL NOT NULL,
+    ask REAL NOT NULL,
+    spread REAL NOT NULL,
+    depth_5c_usd REAL NOT NULL,
+    tick_size REAL NOT NULL,
+    min_order_size REAL NOT NULL,
+    edge_probability REAL NOT NULL,
+    edge REAL NOT NULL,
+    size REAL NOT NULL,
+    notional_usd REAL NOT NULL,
+    taker_fee_rate REAL NOT NULL,
+    taker_fee_usd_est REAL NOT NULL,
+    UNIQUE(version, arm, slug, slot)
+);
+CREATE INDEX IF NOT EXISTS idx_v82_slot_trades
+ON v82_slot_trades(version, arm, slot, decision_ts);
+"""
+
+
+class V82Store(EarlyStore):
+    """Keep independent T-120/T-100 research rows even within the same market."""
+
+    def __init__(self, path):
+        super().__init__(path)
+        self.conn.executescript(V82_SLOT_SCHEMA)
+
+    def record_value_trade(
+        self,
+        *,
+        version: str,
+        arm: str,
+        slug: str,
+        checkpoint_value: int,
+        observation_id: int,
+        signal_ts: float,
+        decision_ts: float,
+        quant_p: float,
+        jev,
+        market_mid: float | None,
+        decision,
+        fee_rate: float,
+    ) -> bool:
+        values = (
+            version, arm, slug, checkpoint_value, observation_id,
+            signal_ts, decision_ts, decision.direction, quant_p,
+            jev.p_yes if jev else None,
+            jev.answerable if jev else None,
+            jev.clarity if jev else None,
+            market_mid, decision.bid, decision.ask, decision.spread,
+            decision.depth_5c_usd, decision.tick_size,
+            decision.min_order_size, decision.probability, decision.edge,
+            decision.size, decision.notional_usd, fee_rate,
+            decision.taker_fee_usd_est,
+        )
+        with self.conn:
+            slot_cur = self.conn.execute(
+                """INSERT OR IGNORE INTO v82_slot_trades
+                (version,arm,slug,slot,observation_id,signal_ts,decision_ts,
+                 direction,quant_p,jev_p,jev_answerable,jev_clarity,market_mid,
+                 bid,ask,spread,depth_5c_usd,tick_size,min_order_size,
+                 edge_probability,edge,size,notional_usd,taker_fee_rate,
+                 taker_fee_usd_est)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                values,
+            )
+        # Preserve the legacy first-trade-per-arm table for compatibility, but
+        # V8.2 reporting uses v82_slot_trades as the authoritative research set.
+        super().record_value_trade(
+            version=version,
+            arm=arm,
+            slug=slug,
+            checkpoint_value=checkpoint_value,
+            observation_id=observation_id,
+            signal_ts=signal_ts,
+            decision_ts=decision_ts,
+            quant_p=quant_p,
+            jev=jev,
+            market_mid=market_mid,
+            decision=decision,
+            fee_rate=fee_rate,
+        )
+        return slot_cur.rowcount == 1
+
+    def slot_trades(
+        self, version: str, arm: str | None = None, slot: int | None = None
+    ) -> list[dict]:
+        query = """SELECT t.*, r.up_won FROM v82_slot_trades t
+                   LEFT JOIN market_results r ON r.slug=t.slug
+                   WHERE t.version=?"""
+        args: list[object] = [version]
+        if arm is not None:
+            query += " AND t.arm=?"
+            args.append(arm)
+        if slot is not None:
+            query += " AND t.slot=?"
+            args.append(slot)
+        query += " ORDER BY t.decision_ts,t.id"
+        return [dict(r) for r in self.conn.execute(query, args).fetchall()]
+
 
 def strategy_slot(seconds_left: int | None) -> int | None:
     """Record only T-120 and T-100; T-110 is intentionally retired."""
@@ -74,7 +189,7 @@ def strategy_slot(seconds_left: int | None) -> int | None:
 
 def safe_trade(row: dict) -> dict:
     return {k: row.get(k) for k in (
-        "arm", "slug", "checkpoint", "signal_ts", "decision_ts", "direction",
+        "arm", "slug", "slot", "signal_ts", "decision_ts", "direction",
         "quant_p", "jev_p", "jev_answerable", "jev_clarity", "market_mid",
         "bid", "ask", "spread", "depth_5c_usd", "tick_size", "min_order_size",
         "edge_probability", "edge", "size", "notional_usd",
@@ -83,18 +198,18 @@ def safe_trade(row: dict) -> dict:
 
 
 def slot_metrics(rows: list[dict], slot: int) -> dict:
-    return arm_metrics([row for row in rows if row.get("checkpoint") == slot])
+    return arm_metrics([row for row in rows if row.get("slot") == slot])
 
 
-def build_report(store: EarlyStore, version: str) -> dict:
+def build_report(store: V82Store, version: str) -> dict:
     params = store.parameters(version)
     if params is None:
         raise ValueError("experiment_not_found")
 
-    trades = {arm: store.value_trades(version, arm) for arm in ARMS}
+    trades = {arm: store.slot_trades(version, arm) for arm in ARMS}
     primary_rows = [
         row for row in trades[PRIMARY_ARM]
-        if row.get("checkpoint") == PRIMARY_SLOT
+        if row.get("slot") == PRIMARY_SLOT
     ]
     primary = arm_metrics(primary_rows)
 
@@ -399,7 +514,7 @@ async def run_v82(
         raise ValueError("TYPESAFE_API_KEY is required for V8.2")
     next_deadline(0, 0, interval)
 
-    store = EarlyStore(settings.db_path)
+    store = V82Store(settings.db_path)
     tasks = []
     try:
         store.ensure_experiment(
@@ -493,7 +608,7 @@ async def run_v82(
 
 
 async def settle_all(settings, db: Path, version: str) -> int:
-    store = EarlyStore(db)
+    store = V82Store(db)
     try:
         async with AsyncPublicClient() as client:
             total = 0
@@ -601,7 +716,7 @@ def main(argv=None):
         )
 
     settled = asyncio.run(settle_all(settings, db, REVISION))
-    store = EarlyStore(db)
+    store = V82Store(db)
     try:
         report = build_report(store, REVISION)
     finally:
