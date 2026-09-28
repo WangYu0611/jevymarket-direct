@@ -1,3 +1,5 @@
+import pytest
+
 from jevymarket.price_value_forward import ValueDecision
 from jevymarket.v83_candidate_filter import (
     classify_candidate,
@@ -32,7 +34,7 @@ def test_first_live_loss_pattern_is_rejected():
     )
     assert not tier.accepted
     assert tier.reason == "weak_jev_mid_market"
-    assert tier.jev_side == 0.60
+    assert tier.jev_side == pytest.approx(0.60)
 
 
 def test_strong_jev_t120_is_full_tier():
