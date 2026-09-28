@@ -588,6 +588,7 @@ def build_live_report(store: LiveStore, paper_gate: dict, mode: str, geoblock: d
         "max_session_orders": 1 if mode == "one" else MAX_SESSION_ORDERS,
         "max_session_notional_usd": MAX_ORDER_USD if mode == "one" else MAX_SESSION_NOTIONAL_USD,
         "paper_gate": paper_gate,
+        "sdk_contract": live_sdk_contract(),
         "geoblock": geoblock,
         "preflight": preflight,
         "paper_observation_report": paper,
