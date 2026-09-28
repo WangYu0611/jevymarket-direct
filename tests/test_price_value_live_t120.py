@@ -253,6 +253,85 @@ def test_only_t120_b_hook_can_reach_live_path():
     assert calls[0]["direction"] == "UP"
 
 
+
+def test_pre_submit_position_check_uses_condition_id(monkeypatch):
+    calls = []
+
+    async def geo():
+        return {"blocked": False, "country": "HK", "region": ""}
+
+    class Page:
+        items = []
+
+    class Pager:
+        async def first_page(self):
+            return Page()
+
+    class Balance:
+        balance = "10000000"
+
+    class Client:
+        wallet = "0xwallet"
+
+        async def get_balance_allowance(self, *, asset_type):
+            assert asset_type == "COLLATERAL"
+            return Balance()
+
+        def list_positions(self, **kwargs):
+            calls.append(("positions", kwargs))
+            assert "market" not in kwargs
+            assert kwargs["condition_id"] == "condition-123"
+            assert kwargs["status"] == "OPEN"
+            return Pager()
+
+        def list_open_orders(self, **kwargs):
+            calls.append(("orders", kwargs))
+            assert kwargs["market"] == "condition-123"
+            return Pager()
+
+    monkeypatch.setattr(live, "geoblock_check", geo)
+    runner = SimpleNamespace(secure_client=Client())
+
+    ok, reason = asyncio.run(
+        live.LiveT120Runner._pre_submit_checks(
+            runner, "btc-updown-5m-test", "condition-123"
+        )
+    )
+
+    assert ok is True
+    assert reason == "ok"
+    assert calls[0][0] == "positions"
+    assert calls[1][0] == "orders"
+
+
+def test_pre_submit_position_check_error_exposes_class_only(monkeypatch):
+    async def geo():
+        return {"blocked": False, "country": "HK", "region": ""}
+
+    class Balance:
+        balance = "10000000"
+
+    class Client:
+        wallet = "0xwallet"
+
+        async def get_balance_allowance(self, *, asset_type):
+            return Balance()
+
+        def list_positions(self, **kwargs):
+            raise TypeError("secret-ish error text must not be surfaced")
+
+    monkeypatch.setattr(live, "geoblock_check", geo)
+    runner = SimpleNamespace(secure_client=Client())
+
+    ok, reason = asyncio.run(
+        live.LiveT120Runner._pre_submit_checks(
+            runner, "btc-updown-5m-test", "condition-123"
+        )
+    )
+
+    assert ok is False
+    assert reason == "position_check_failed:TypeError"
+
 def test_geoblock_failure_prevents_secure_client_creation(tmp_path, monkeypatch):
     report = make_report(tmp_path)
     args = SimpleNamespace(
