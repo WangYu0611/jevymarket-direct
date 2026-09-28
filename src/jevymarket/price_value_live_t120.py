@@ -65,7 +65,7 @@ from .price_value_t120_main import (
 from .run_paths import run_output_path
 from .signal import JevView, quantitative_up_probability
 
-REVISION = "v8.2-t120-live-r2"
+REVISION = "v8.2-t120-live-r3"
 CONFIRM_ONE = "ONE_REAL_T120_QUANT_JEV_ASK"
 CONFIRM_SESSION = "LIVE_T120_QUANT_JEV_ASK_SESSION"
 LIVE_SLOT = 120
@@ -97,6 +97,17 @@ CREATE TABLE IF NOT EXISTS v82_live_orders (
     user_events_json TEXT,
     error_json TEXT
 );
+CREATE TABLE IF NOT EXISTS v82_live_events (
+    id INTEGER PRIMARY KEY,
+    slug TEXT NOT NULL,
+    slot INTEGER NOT NULL,
+    ts REAL NOT NULL,
+    stage TEXT NOT NULL,
+    outcome TEXT NOT NULL,
+    reason TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_v82_live_events
+ON v82_live_events(ts, slug);
 """
 
 
@@ -182,6 +193,21 @@ class LiveStore(V82Store):
     def live_rows(self) -> list[dict]:
         return [dict(r) for r in self.conn.execute(
             "SELECT * FROM v82_live_orders ORDER BY id"
+        ).fetchall()]
+
+    def record_live_event(
+        self, *, slug: str, stage: str, outcome: str, reason: str,
+    ) -> None:
+        with self.conn:
+            self.conn.execute(
+                """INSERT INTO v82_live_events(slug,slot,ts,stage,outcome,reason)
+                   VALUES (?,?,?,?,?,?)""",
+                (slug, LIVE_SLOT, time.time(), stage, outcome, reason[:160]),
+            )
+
+    def live_events(self) -> list[dict]:
+        return [dict(r) for r in self.conn.execute(
+            "SELECT * FROM v82_live_events ORDER BY id"
         ).fetchall()]
 
     def unresolved_live_rows(self) -> list[dict]:
@@ -312,6 +338,9 @@ class LiveT120Runner(V82Runner):
 
         ok, reason = await self._pre_submit_checks(slug, condition_id)
         if not ok:
+            store.record_live_event(
+                slug=slug, stage="pre_submit_guard", outcome="skip", reason=reason
+            )
             self.console.print(Panel(
                 f"{slug}\n[bold red]REAL SKIP[/] · {reason}",
                 title="[bold red] T120 LIVE GUARD [/]",
@@ -335,6 +364,10 @@ class LiveT120Runner(V82Runner):
             try:
                 await asyncio.wait_for(stream_ready.wait(), 2.0)
             except TimeoutError:
+                store.record_live_event(
+                    slug=slug, stage="user_stream", outcome="skip",
+                    reason="user_stream_not_ready",
+                )
                 self.console.print(Panel(
                     f"{slug}\n[bold yellow]REAL SKIP[/] · user_stream_not_ready",
                     title="[bold yellow] T120 LIVE PRE-SUBMIT [/]",
@@ -342,6 +375,10 @@ class LiveT120Runner(V82Runner):
                 ))
                 return
             if stream_task.done():
+                store.record_live_event(
+                    slug=slug, stage="user_stream", outcome="skip",
+                    reason="user_stream_stopped",
+                )
                 self.console.print(Panel(
                     f"{slug}\n[bold yellow]REAL SKIP[/] · user_stream_stopped",
                     title="[bold yellow] T120 LIVE PRE-SUBMIT [/]",
@@ -355,6 +392,10 @@ class LiveT120Runner(V82Runner):
                 fresh = local_snapshot(cand, self.s, self.store)
                 fresh_quant = quantitative_up_probability(fresh)
             except Exception as exc:
+                store.record_live_event(
+                    slug=slug, stage="final_refresh", outcome="skip",
+                    reason="final_public_refresh_failed:" + safe_error(exc)["classes"][0],
+                )
                 self.console.print(Panel(
                     f"{slug}\n[bold yellow]REAL SKIP[/] · final_public_refresh_failed · "
                     f"{safe_error(exc)['classes'][0]}",
@@ -365,6 +406,10 @@ class LiveT120Runner(V82Runner):
 
             fresh_direction = quant_direction(fresh_quant)
             if fresh_quant is None or fresh_direction != direction:
+                store.record_live_event(
+                    slug=slug, stage="final_refresh", outcome="skip",
+                    reason="final_quant_invalidated",
+                )
                 self.console.print(Panel(
                     f"{slug}\n[bold yellow]REAL SKIP[/] · final_quant_invalidated",
                     title="[bold yellow] T120 LIVE PRE-SUBMIT [/]",
@@ -372,6 +417,10 @@ class LiveT120Runner(V82Runner):
                 ))
                 return
             if not jev_quality(view, self.s):
+                store.record_live_event(
+                    slug=slug, stage="final_refresh", outcome="skip",
+                    reason="final_jev_quality_failed",
+                )
                 self.console.print(Panel(
                     f"{slug}\n[bold yellow]REAL SKIP[/] · final_jev_quality_failed",
                     title="[bold yellow] T120 LIVE PRE-SUBMIT [/]",
@@ -383,6 +432,10 @@ class LiveT120Runner(V82Runner):
                 fresh_quant, fresh_direction, cand.book, self.s, fee_rate=self.fee_rate
             )
             if fresh_decision is None:
+                store.record_live_event(
+                    slug=slug, stage="final_refresh", outcome="skip",
+                    reason="final_value_invalidated:" + fresh_reason,
+                )
                 self.console.print(Panel(
                     f"{slug}\n[bold yellow]REAL SKIP[/] · final_value_invalidated:{fresh_reason}",
                     title="[bold yellow] T120 LIVE PRE-SUBMIT [/]",
@@ -391,6 +444,10 @@ class LiveT120Runner(V82Runner):
                 return
 
             fresh_token = token_for_direction(cand, direction)
+            store.record_live_event(
+                slug=slug, stage="final_refresh", outcome="pass",
+                reason="live_intent_ready",
+            )
             if not store.reserve_live_intent(
                 slug=slug,
                 condition_id=cand.condition_id,
@@ -404,6 +461,9 @@ class LiveT120Runner(V82Runner):
             ):
                 return
             store.update_live(slug, "placing")
+            store.record_live_event(
+                slug=slug, stage="submit", outcome="attempt", reason="place_market_order"
+            )
             started = time.perf_counter_ns()
             try:
                 response = await self.secure_client.place_market_order(
@@ -494,6 +554,11 @@ class LiveT120Runner(V82Runner):
             return
         if self.live_halted:
             return
+        store: LiveStore = self.store
+        store.record_live_event(
+            slug=slug, stage="paper_candidate", outcome="pass",
+            reason="t120_b_value_ready",
+        )
         await self._place_fak(
             slug=slug,
             condition_id=cand.condition_id,
@@ -507,6 +572,11 @@ class LiveT120Runner(V82Runner):
 def build_live_report(store: LiveStore, paper_gate: dict, mode: str, geoblock: dict, preflight: dict) -> dict:
     paper = build_paper_report(store, PAPER_REVISION)
     rows = store.live_rows()
+    live_events = store.live_events()
+    event_summary = {}
+    for event in live_events:
+        key = f"{event['stage']}:{event['outcome']}:{event['reason']}"
+        event_summary[key] = event_summary.get(key, 0) + 1
     return {
         "format": REVISION,
         "paper_only": False,
@@ -518,6 +588,11 @@ def build_live_report(store: LiveStore, paper_gate: dict, mode: str, geoblock: d
         "geoblock": geoblock,
         "preflight": preflight,
         "paper_observation_report": paper,
+        "live_event_summary": event_summary,
+        "live_events": [
+            {k: event.get(k) for k in ("slug", "slot", "ts", "stage", "outcome", "reason")}
+            for event in live_events
+        ],
         "live_orders": [
             {
                 k: row.get(k) for k in (
@@ -612,9 +687,16 @@ async def run(
                     print_primary(console, paper)
                     print_shadow(console, paper)
                     print_rejections(console, paper)
+                    events = store.live_events()
+                    candidate_count = sum(
+                        e["stage"] == "paper_candidate" and e["outcome"] == "pass"
+                        for e in events
+                    )
+                    skip_count = sum(e["outcome"] == "skip" for e in events)
                     console.print(
                         f"[bold red]REAL attempts={store.live_attempt_count()} "
-                        f"planned_notional=USD {store.planned_notional_total():.2f}[/]"
+                        f"planned_notional=USD {store.planned_notional_total():.2f}[/] "
+                        f"[dim]T120 B模拟候选={candidate_count} | 真实前置跳过={skip_count}[/]"
                     )
                     next_board = clock() + 60
                 if mode == "one" and runner.live_done.is_set():

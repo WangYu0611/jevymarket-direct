@@ -315,7 +315,7 @@ def print_primary(console: Console, report: dict, *, final: bool = False) -> Non
         title="V8.2 主策略 · T-120 Quant + Jev + 最新ASK" + (" · FINAL" if final else ""),
         header_style="bold white",
     )
-    for col in ("交易/结算", "胜/负", "胜率", "净PnL", "净ROI", "去Top3", "+1tick", "距50", "状态"):
+    for col in ("模拟候选/结算", "胜/负", "胜率", "净PnL", "净ROI", "去Top3", "+1tick", "距50", "状态"):
         table.add_column(col)
     status = "[bold green]PASS[/]" if m["gate"]["passed"] else "[yellow]收集中[/]"
     table.add_row(
@@ -345,7 +345,7 @@ def print_shadow(console: Console, report: dict) -> None:
         title="V8.2 影子研究 · 不影响主策略PASS",
         header_style="bold white",
     )
-    for col in ("研究项", "交易/结算", "胜/负", "胜率", "净PnL", "净ROI"):
+    for col in ("研究项", "模拟候选/结算", "胜/负", "胜率", "净PnL", "净ROI"):
         table.add_column(col)
     for label, key in rows:
         m = metrics[key]

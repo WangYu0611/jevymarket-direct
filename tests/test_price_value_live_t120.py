@@ -224,6 +224,7 @@ def test_only_t120_b_hook_can_reach_live_path():
 
     class Runner:
         live_halted = False
+        store = SimpleNamespace(record_live_event=lambda **kwargs: None)
 
         async def _place_fak(self, **kwargs):
             calls.append(kwargs)
@@ -351,6 +352,26 @@ def test_check_only_still_never_places_order(tmp_path, monkeypatch):
     result = asyncio.run(live.async_main(args))
     assert result["termination"] == "check_only_complete"
 
+
+
+def test_live_event_log_persists_pre_submit_reason(tmp_path):
+    store = live.LiveStore(tmp_path / "live-events.db")
+    try:
+        store.record_live_event(
+            slug="m1",
+            stage="final_refresh",
+            outcome="skip",
+            reason="final_value_invalidated:edge_below_threshold",
+        )
+        rows = store.live_events()
+        assert len(rows) == 1
+        assert rows[0]["slug"] == "m1"
+        assert rows[0]["slot"] == 120
+        assert rows[0]["stage"] == "final_refresh"
+        assert rows[0]["outcome"] == "skip"
+        assert rows[0]["reason"] == "final_value_invalidated:edge_below_threshold"
+    finally:
+        store.close()
 
 def test_live_constants_match_user_requested_caps():
     assert live.LIVE_SLOT == 120
