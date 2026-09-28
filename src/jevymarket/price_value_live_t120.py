@@ -65,7 +65,7 @@ from .price_value_t120_main import (
 from .run_paths import run_output_path
 from .signal import JevView, quantitative_up_probability
 
-REVISION = "v8.2-t120-live-r1"
+REVISION = "v8.2-t120-live-r2"
 CONFIRM_ONE = "ONE_REAL_T120_QUANT_JEV_ASK"
 CONFIRM_SESSION = "LIVE_T120_QUANT_JEV_ASK_SESSION"
 LIVE_SLOT = 120
