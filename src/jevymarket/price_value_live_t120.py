@@ -38,17 +38,6 @@ from .maker_live_canary import (
     safe_response,
 )
 from .market_data import watch_chainlink_anchors
-from .price_value_t120_main import (
-    INTERVAL_SECONDS,
-    REVISION as PAPER_REVISION,
-    V82Runner,
-    V82Store,
-    build_report as build_paper_report,
-    experiment_parameters,
-    print_primary,
-    print_rejections,
-    print_shadow,
-)
 from .price_value_forward import (
     CRYPTO_TAKER_FEE_RATE,
     ValueDecision,
@@ -56,6 +45,21 @@ from .price_value_forward import (
     jev_quality,
     quant_direction,
     value_decision,
+)
+from .price_value_t120_main import (
+    INTERVAL_SECONDS,
+    V82Runner,
+    V82Store,
+    experiment_parameters,
+    print_primary,
+    print_rejections,
+    print_shadow,
+)
+from .price_value_t120_main import (
+    REVISION as PAPER_REVISION,
+)
+from .price_value_t120_main import (
+    build_report as build_paper_report,
 )
 from .run_paths import run_output_path
 from .signal import JevView, quantitative_up_probability
