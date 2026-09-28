@@ -405,8 +405,11 @@ async def run_live(seconds: int, db: Path, report: dict, client: AsyncSecureClie
             else:
                 report["candidate_seen"] = asdict(candidate)
                 try:
+                    # Let the authenticated client select its canonical account
+                    # wallet. This is required for Deposit Wallet/proxy accounts,
+                    # where the signer and trading wallet are intentionally distinct.
                     positions = await client.list_positions(
-                        user=str(client.wallet), condition_id=candidate.condition, status="OPEN"
+                        condition_id=candidate.condition, status="OPEN"
                     ).first_page()
                 except Exception as exc:
                     report["termination"] = "market_position_check_failed"
