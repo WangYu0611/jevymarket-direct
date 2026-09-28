@@ -117,7 +117,6 @@ async def run_probe(amount: Decimal) -> dict:
 
         try:
             positions_page = await secure.list_positions(
-                user=str(secure.wallet),
                 condition_id=condition_id,
                 status="OPEN",
             ).first_page()
