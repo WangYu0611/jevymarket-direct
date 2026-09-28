@@ -20,6 +20,7 @@ from polymarket.models.clob.order_response import AcceptedOrder, RejectedOrder
 from polymarket.streams import UserSpec
 
 from .config import load_settings
+from .executor import builder_api_key_from_settings
 from .maker import MakerRuntime
 from .maker_config import MakerConfig
 from .maker_diagnostics import diagnostic_report
@@ -444,6 +445,7 @@ async def async_main(args) -> dict:
         client = await AsyncSecureClient.create(
             private_key=settings.polymarket_private_key,
             wallet=settings.polymarket_wallet or None,
+            api_key=builder_api_key_from_settings(settings),
         )
     except Exception as exc:
         report["termination"] = "client_create_failed"
