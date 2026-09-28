@@ -20,6 +20,7 @@ from polymarket.models.clob.order_response import AcceptedOrder, RejectedOrder
 from polymarket.streams import UserSpec
 
 from .config import load_settings
+from .executor import builder_api_key_from_settings
 from .maker import MakerRuntime
 from .maker_config import MakerConfig
 from .maker_diagnostics import diagnostic_report
@@ -405,7 +406,7 @@ async def run_live(seconds: int, db: Path, report: dict, client: AsyncSecureClie
                 report["candidate_seen"] = asdict(candidate)
                 try:
                     positions = await client.list_positions(
-                        user=str(client.wallet), market=[candidate.condition], status="OPEN"
+                        user=str(client.wallet), condition_id=candidate.condition, status="OPEN"
                     ).first_page()
                 except Exception as exc:
                     report["termination"] = "market_position_check_failed"
@@ -444,6 +445,7 @@ async def async_main(args) -> dict:
         client = await AsyncSecureClient.create(
             private_key=settings.polymarket_private_key,
             wallet=settings.polymarket_wallet or None,
+            api_key=builder_api_key_from_settings(settings),
         )
     except Exception as exc:
         report["termination"] = "client_create_failed"

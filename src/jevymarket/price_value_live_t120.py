@@ -39,6 +39,7 @@ from .maker_live_canary import (
     safe_response,
 )
 from .market_data import watch_chainlink_anchors
+from .polymarket_contract import live_sdk_contract
 from .price_value_forward import (
     CRYPTO_TAKER_FEE_RATE,
     ValueDecision,
@@ -65,7 +66,7 @@ from .price_value_t120_main import (
 from .run_paths import run_output_path
 from .signal import JevView, quantitative_up_probability
 
-REVISION = "v8.2-t120-live-r3"
+REVISION = "v8.2-t120-live-r4"
 CONFIRM_ONE = "ONE_REAL_T120_QUANT_JEV_ASK"
 CONFIRM_SESSION = "LIVE_T120_QUANT_JEV_ASK_SESSION"
 LIVE_SLOT = 120
@@ -587,6 +588,7 @@ def build_live_report(store: LiveStore, paper_gate: dict, mode: str, geoblock: d
         "max_session_orders": 1 if mode == "one" else MAX_SESSION_ORDERS,
         "max_session_notional_usd": MAX_ORDER_USD if mode == "one" else MAX_SESSION_NOTIONAL_USD,
         "paper_gate": paper_gate,
+        "sdk_contract": live_sdk_contract(),
         "geoblock": geoblock,
         "preflight": preflight,
         "paper_observation_report": paper,
@@ -719,6 +721,14 @@ async def run(
 
 
 async def async_main(args) -> dict:
+    sdk_contract = live_sdk_contract()
+    if not sdk_contract["ok"]:
+        return {
+            "format": REVISION,
+            "termination": "live_sdk_contract_failed",
+            "sdk_contract": sdk_contract,
+        }
+
     gate = evaluate_live_gate(args.paper_report)
     if args.mode == "one" and not gate["canary_ready"]:
         return {"format": REVISION, "termination": "paper_canary_gate_failed", "paper_gate": gate}
@@ -853,7 +863,7 @@ def main(argv=None):
         json.dump(result, handle, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
     print(json.dumps({
         k: result.get(k)
-        for k in ("format", "termination", "geoblock", "preflight", "paper_gate")
+        for k in ("format", "termination", "sdk_contract", "geoblock", "preflight", "paper_gate")
     }, ensure_ascii=False, indent=2))
     print(f"已导出 → {out.resolve()}", flush=True)
 

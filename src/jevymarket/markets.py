@@ -321,7 +321,7 @@ def passes_static_filters(m: Market, s: Settings, now: datetime | None = None) -
 
 async def fetch_book(client: AsyncPublicClient, m: Market) -> Book:
     books = await client.get_order_books(
-        token_ids=[str(m.outcomes.yes.token_id), str(m.outcomes.no.token_id)]
+        asset_ids=[str(m.outcomes.yes.token_id), str(m.outcomes.no.token_id)]
     )
     return book_from_orderbooks(m, books)
 
