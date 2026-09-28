@@ -1,6 +1,6 @@
-# V8.2 T-120 Live Canary
+# V8.1 T-120 Live Canary
 
-This module is the first authenticated live path for the V8.2 price-value strategy.
+This module is the first authenticated live path for the V8.1 price-value strategy.
 
 It is intentionally narrower than the paper strategy.
 
@@ -14,20 +14,20 @@ A real order can be attempted only when **all** of these are true:
 - Jev direction agrees with Quant;
 - after Jev returns, the public book and Quant are refreshed;
 - refreshed Quant is still high confidence on the same side;
-- predicted-side best ask is still within the existing V8.2 price band;
+- predicted-side best ask is still within the existing V8.1 price band;
 - Quant minus refreshed ask still meets the existing 8% minimum edge;
 - spread and 5-cent depth still pass;
 - final refresh immediately before submission still passes the same rules.
 
-T-100 and C continue to be recorded as V8.2 shadow research, but they can never
-reach the live placement hook. T-110 is retired from the V8.2 protocol.
+T-110 and T-100 continue to be recorded by the V8.1 paper logic, but they can
+never reach the live placement hook.
 
-Only the primary T-120 B arm (Quant + Jev + response-time latest ASK) can reach
-live placement. A and C remain shadow/paper-only.
+Only the B arm (Quant + Jev + response-time ASK) can reach live placement.
+A and C remain paper-only.
 
 ## Order type and hard caps
 
-Live BUY uses the official SDK market-order workflow. Only the V8.2 primary T-120 B hook can reach it:
+Live BUY uses the official SDK market-order workflow:
 
 - order type: FAK;
 - max price: final refreshed best ask;
@@ -44,13 +44,13 @@ For a future full live session, hard upper bounds are:
 
 ## Paper gates
 
-`--live-one` is an infrastructure canary. For a V8.2 report it reads the
-primary strategy metrics directly. It requires at least 20 settled T-120 primary
-trades, >65% win rate, positive estimated net PnL, and positive +1-tick
-price-stress PnL. Legacy V8.1 reports remain readable for compatibility.
+`--live-one` is an infrastructure canary. Because real money is T-120-only, it
+uses the T-120 subset of the supplied V8.1 B arm. It requires at least 20 settled
+T-120 simulated trades, >65% win rate, positive estimated net PnL, and positive
++1-tick price-stress PnL.
 
 `--live-session` is stricter. The **T-120 subset itself** must pass the complete
-V8.2 profitability gate: >=50 settled T-120 trades, >65% win rate, positive net
+V8.1 profitability gate: >=50 settled T-120 trades, >65% win rate, positive net
 PnL, positive PnL after removing the three largest winners, and positive +1-tick
 stress PnL. T-110/T-100 results cannot unlock the real session.
 
@@ -76,7 +76,7 @@ gate, and geoblock without placing an order:
 ```powershell
 uv run --frozen python -m jevymarket.price_value_live_t120 \
     --check-only \
-    --paper-report "runs\v82_t120_main_shadow_....json.gz"
+    --paper-report "runs\v81_early_value_forward_....json.gz"
 ```
 
 ## First real canary
@@ -87,7 +87,7 @@ The first real test should be one order only:
 uv run --frozen python -m jevymarket.price_value_live_t120 \
     --live-one \
     --confirm ONE_REAL_T120_QUANT_JEV_ASK \
-    --paper-report "runs\v82_t120_main_shadow_....json.gz" \
+    --paper-report "runs\v81_early_value_forward_....json.gz" \
     --seconds 86400
 ```
 
@@ -129,7 +129,7 @@ fails closed and must be reviewed manually before another live run.
 uv run --frozen python -m jevymarket.price_value_live_t120 \
     --live-one \
     --confirm ONE_REAL_T120_QUANT_JEV_ASK \
-    --paper-report "runs\v82_t120_main_shadow_....json.gz" \
-    --resume-db "runs\jevymarket.v82-live-t120_....db" \
+    --paper-report "runs\v81_early_value_forward_....json.gz" \
+    --resume-db "runs\jevymarket.v81-live-t120_....db" \
     --seconds 86400
 ```
