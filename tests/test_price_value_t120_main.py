@@ -6,6 +6,7 @@ import pytest
 from jevymarket.price_value_forward import ValueDecision
 from jevymarket.price_value_t120_main import (
     PRIMARY_ARM,
+    PRIMARY_PREFETCH_SECONDS,
     PRIMARY_SLOT,
     REPORT_FORMAT,
     REVISION,
@@ -13,6 +14,7 @@ from jevymarket.price_value_t120_main import (
     V82Store,
     build_report,
     experiment_parameters,
+    read_candidate_slot,
     strategy_slot,
 )
 
@@ -65,9 +67,30 @@ def test_v82_only_samples_t120_and_t100(seconds_left, slot):
     assert strategy_slot(seconds_left) == slot
 
 
+
+@pytest.mark.parametrize(
+    ("seconds_left", "slot"),
+    [
+        (131, None),
+        (130, 120),
+        (121, 120),
+        (120, 120),
+        (111, 120),
+        (110, None),
+        (101, None),
+        (100, 100),
+        (91, 100),
+        (90, None),
+    ],
+)
+def test_v82_prefetch_opens_one_cadence_before_primary(seconds_left, slot):
+    assert read_candidate_slot(seconds_left) == slot
+    assert PRIMARY_PREFETCH_SECONDS == 130
+
 def test_manifest_makes_t120_b_primary_and_t100_c_shadow():
     p = experiment_parameters(settings(), 10.0, .07)
     assert p["primary_strategy"]["slot"] == 120
+    assert p["primary_strategy"]["prefetch_start_seconds"] == 130
     assert p["primary_strategy"]["arm"] == "B_quant_jev_taker"
     assert p["shadow_research"]["retain_t100"] is True
     assert p["shadow_research"]["retain_c"] is True

@@ -51,9 +51,10 @@ from .price_value_forward import (
 from .run_paths import run_output_path
 from .signal import quantitative_up_probability
 
-REVISION = "v8.2-t120-main-shadow-r1"
-REPORT_FORMAT = "v8.2-t120-main-shadow-report-r1"
+REVISION = "v8.2-t120-main-shadow-r2"
+REPORT_FORMAT = "v8.2-t120-main-shadow-report-r2"
 PRIMARY_SLOT = 120
+PRIMARY_PREFETCH_SECONDS = 130
 SHADOW_SLOT = 100
 SLOTS = (PRIMARY_SLOT, SHADOW_SLOT)
 INTERVAL_SECONDS = 10.0
@@ -192,6 +193,19 @@ def strategy_slot(seconds_left: int | None) -> int | None:
     return None
 
 
+def read_candidate_slot(seconds_left: int | None) -> int | None:
+    """Open the T-120 read one cadence early so first-market metadata cannot eat the slot.
+
+    The early 121..130s read is warm-up only unless the network read itself
+    finishes inside the real 111..120s primary window. T-110 remains retired.
+    """
+    if seconds_left is None:
+        return None
+    if 120 < seconds_left <= PRIMARY_PREFETCH_SECONDS:
+        return PRIMARY_SLOT
+    return strategy_slot(seconds_left)
+
+
 def safe_trade(row: dict) -> dict:
     return {k: row.get(k) for k in (
         "arm", "slug", "slot", "signal_ts", "decision_ts", "direction",
@@ -235,6 +249,7 @@ def build_report(store: V82Store, version: str) -> dict:
         "live_trading_enabled": False,
         "primary_strategy": {
             "slot": PRIMARY_SLOT,
+            "prefetch_start_seconds": PRIMARY_PREFETCH_SECONDS,
             "arm": PRIMARY_ARM,
             "description": "T-120 Quant + Jev confirmation + response-time refreshed Quant/latest ASK",
             "metrics": primary,
@@ -281,6 +296,7 @@ def build_report(store: V82Store, version: str) -> dict:
         },
         "limitations": [
             "V8.2 is a fresh forward protocol chosen after V8.1; V8.1 outcomes are not reused as V8.2 validation.",
+            "R2 opens a warm-up read at T-130..T-120 so metadata latency cannot silently consume the T-120 slot.",
             "Only T-120 B is the primary strategy and only it can pass the experiment gate.",
             "T-100 and C are retained as shadow research and never affect the primary gate.",
             "T-110 is intentionally retired from new V8.2 Jev requests.",
@@ -380,9 +396,10 @@ class V82Runner(EarlyRunner):
         slug = current_slug()
         market_start = int(slug.rsplit("-", 1)[1])
         approximate_left = int(market_start + 300 - time.time())
-        slot = strategy_slot(approximate_left)
-        if slot is None:
+        candidate_slot = read_candidate_slot(approximate_left)
+        if candidate_slot is None:
             return
+        slot = candidate_slot
 
         started = time.monotonic()
         cand = snapshot = None
@@ -394,11 +411,24 @@ class V82Runner(EarlyRunner):
             snapshot = local_snapshot(cand, self.s, self.store)
             actual_slot = strategy_slot(snapshot.seconds_left)
             if actual_slot is None:
-                return
-            slot = actual_slot
-            if not snapshot.trade_ready:
-                reason = "prediction_inputs_not_ready"
+                # The 121..130s read intentionally warms market metadata/book.
+                # If it finishes before T-120, wait for the next 10s cadence.
+                if candidate_slot == PRIMARY_SLOT and snapshot.seconds_left > PRIMARY_SLOT:
+                    return
+                # Do not silently lose a primary slot if the first read crossed
+                # below T-110; persist a diagnostic row without a checkpoint.
+                status = "timing_miss"
+                reason = "primary_window_crossed_during_read"
             else:
+                slot = actual_slot
+                if slot == PRIMARY_SLOT:
+                    # Metadata was fetched no more than ~10s before the primary
+                    # read. Touch its freshness so T-100 research 20s later
+                    # doesn't pay another metadata round-trip at the slot edge.
+                    self.metadata_read_at = time.monotonic()
+            if actual_slot is not None and not snapshot.trade_ready:
+                reason = "prediction_inputs_not_ready"
+            elif actual_slot is not None:
                 quant_p = quantitative_up_probability(snapshot)
                 if quant_p is None:
                     reason = "quant_probability_unavailable"
@@ -512,6 +542,7 @@ def experiment_parameters(settings, interval: float, fee_rate: float) -> dict:
         "timeframe": "5m",
         "primary_strategy": {
             "slot": PRIMARY_SLOT,
+            "prefetch_start_seconds": PRIMARY_PREFETCH_SECONDS,
             "arm": PRIMARY_ARM,
             "rule": "Quant>=92% + Jev quality/direction + refreshed Quant + latest ASK value rules",
         },
