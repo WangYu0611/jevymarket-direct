@@ -66,6 +66,54 @@ def make_report(tmp_path, *, t120_count=23):
     return path
 
 
+
+def make_v82_report(tmp_path, *, settled=23, passed=False):
+    metrics = {
+        "trades": settled,
+        "settled": settled,
+        "pending": 0,
+        "wins": max(0, settled - 3),
+        "losses": min(3, settled),
+        "win_rate": (settled - min(3, settled)) / settled if settled else None,
+        "stake_usd": settled * 5.0,
+        "gross_pnl_before_fee": 10.0,
+        "estimated_taker_fee_usd": 1.0,
+        "net_pnl_estimated": 9.0,
+        "net_roi_estimated": .08,
+        "net_pnl_minus_top3_positive_contributions": 2.0,
+        "ask_mean": .70,
+        "ask_median": .70,
+        "edge_mean": .20,
+        "edge_median": .20,
+        "checkpoint_distribution": {"T-120": settled},
+        "stress_plus_1tick": {
+            "mode": "plus_1tick",
+            "settled": settled,
+            "net_pnl_estimated": 7.0,
+            "positive": max(0, settled - 3),
+        },
+        "stress_plus_1cent": {
+            "mode": "plus_1cent",
+            "settled": settled,
+            "net_pnl_estimated": 6.0,
+            "positive": max(0, settled - 3),
+        },
+        "gate": {"checks": {}, "passed": passed},
+    }
+    payload = {
+        "format": "v8.2-t120-main-shadow-report-r1",
+        "primary_strategy": {
+            "slot": 120,
+            "arm": "B_quant_jev_taker",
+            "metrics": metrics,
+            "passed": passed,
+        },
+    }
+    path = tmp_path / "v82.json.gz"
+    with gzip.open(path, "wt", encoding="utf-8") as handle:
+        json.dump(payload, handle)
+    return path
+
 def decision(notional=4.99, ask=.70):
     return ValueDecision(
         direction="UP",
@@ -108,6 +156,18 @@ def test_session_requires_full_t120_paper_gate(tmp_path):
     assert gate["canary_ready"]
     assert gate["session_ready"]
 
+
+
+def test_v82_primary_metrics_are_used_directly_for_live_gate(tmp_path):
+    gate = live.evaluate_live_gate(make_v82_report(tmp_path, settled=23, passed=False))
+    assert gate["report_generation"] == "v8.2"
+    assert gate["canary_ready"]
+    assert not gate["session_ready"]
+    assert gate["paper_b_t120"]["settled"] == 23
+
+    gate2 = live.evaluate_live_gate(make_v82_report(tmp_path, settled=50, passed=True))
+    assert gate2["canary_ready"]
+    assert gate2["session_ready"]
 
 def test_market_order_is_fak_bounded_by_final_ask_and_five_dollars():
     kwargs = live.market_order_kwargs("token", decision())
