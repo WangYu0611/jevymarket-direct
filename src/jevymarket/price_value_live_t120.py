@@ -305,8 +305,12 @@ class LiveT120Runner(V82Runner):
             return False, "insufficient_collateral"
 
         try:
+            # Omit `user` so the authenticated SecureClient resolves the canonical
+            # Polymarket account wallet itself. In the unified SDK the configured
+            # account wallet may differ from the signer EOA (for example Deposit
+            # Wallet / proxy accounts), and stringifying client.wallet is not a
+            # supported way to select the Data API user.
             positions = await self.secure_client.list_positions(
-                user=str(self.secure_client.wallet),
                 condition_id=condition_id,
                 status="OPEN",
             ).first_page()
