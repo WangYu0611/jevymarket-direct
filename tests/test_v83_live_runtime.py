@@ -84,7 +84,7 @@ def test_final_refresh_rejects_first_live_loss_pattern():
     assert state["final_tier"] is None
 
 
-def test_final_refresh_resizes_extreme_tier_to_minimum_shares():
+def test_final_refresh_resizes_price_tier_to_minimum_shares():
     state = context(slot=120, jev_p=0.62, minimum=True)
     decision, reason = call_final(
         p_up=0.97,
@@ -101,7 +101,7 @@ def test_final_refresh_resizes_extreme_tier_to_minimum_shares():
     assert decision is not None
     assert decision.size == 5.0
     assert decision.notional_usd == pytest.approx(4.10)
-    assert state["final_tier"] == "t120_extreme_high"
+    assert state["final_tier"] == "t120_price_high"
 
 
 def test_final_refresh_keeps_full_sizing_for_strong_tier():
