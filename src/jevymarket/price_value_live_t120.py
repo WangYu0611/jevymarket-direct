@@ -720,6 +720,14 @@ async def run(
 
 
 async def async_main(args) -> dict:
+    sdk_contract = live_sdk_contract()
+    if not sdk_contract["ok"]:
+        return {
+            "format": REVISION,
+            "termination": "live_sdk_contract_failed",
+            "sdk_contract": sdk_contract,
+        }
+
     gate = evaluate_live_gate(args.paper_report)
     if args.mode == "one" and not gate["canary_ready"]:
         return {"format": REVISION, "termination": "paper_canary_gate_failed", "paper_gate": gate}
