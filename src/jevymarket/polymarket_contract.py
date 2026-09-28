@@ -79,7 +79,7 @@ def live_sdk_contract() -> dict:
     _require_params(
         "place_market_order",
         AsyncSecureClient.place_market_order,
-        {"asset_id", "side", "amount", "max_spend", "max_price", "order_type"},
+        {"token_id", "side", "amount", "max_spend", "max_price", "order_type"},
         failures,
     )
     _require_params(
@@ -118,7 +118,7 @@ def live_sdk_contract() -> dict:
             "get_trading_approvals_state",
             "UserSpec(markets=[condition_id])",
             "AsyncSecureClient.subscribe",
-            "place_market_order(asset_id=..., BUY, amount, max_spend, max_price, FAK)",
+            "place_market_order(token_id=..., BUY, amount, max_spend, max_price, FAK)",
             "wait_for_order_fill_settlement",
             "get_order(order_id=...)",
             "list_account_trades(market=...)",
