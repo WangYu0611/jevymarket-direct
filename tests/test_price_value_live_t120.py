@@ -224,6 +224,7 @@ def test_only_t120_b_hook_can_reach_live_path():
 
     class Runner:
         live_halted = False
+        store = SimpleNamespace(record_live_event=lambda **kwargs: None)
 
         async def _place_fak(self, **kwargs):
             calls.append(kwargs)
