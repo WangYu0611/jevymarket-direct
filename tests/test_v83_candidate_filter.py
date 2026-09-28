@@ -50,16 +50,29 @@ def test_strong_jev_t120_is_full_tier():
     assert not tier.minimum_shares
 
 
-def test_market_extreme_t120_keeps_controlled_volume():
+def test_high_price_t120_keeps_controlled_volume():
     tier = classify_candidate(
         slot=120,
         direction="UP",
-        quant_p=0.97,
-        jev_p=0.62,
-        decision=decision(ask=0.82, edge=0.15),
+        quant_p=0.93,
+        jev_p=0.56,
+        decision=decision(ask=0.82, edge=0.11),
     )
     assert tier.accepted
-    assert tier.name == "t120_extreme_high"
+    assert tier.name == "t120_price_high"
+    assert tier.minimum_shares
+
+
+def test_low_price_t120_keeps_controlled_volume():
+    tier = classify_candidate(
+        slot=120,
+        direction="DOWN",
+        quant_p=0.04,
+        jev_p=0.42,
+        decision=decision(ask=0.36, edge=0.60),
+    )
+    assert tier.accepted
+    assert tier.name == "t120_price_low"
     assert tier.minimum_shares
 
 
@@ -74,7 +87,7 @@ def test_mid_market_weak_jev_is_not_rescued_by_large_quant_edge():
     assert not tier.accepted
 
 
-def test_strict_t110_fallback_is_minimum_share_tier():
+def test_strong_t110_is_minimum_share_tier():
     tier = classify_candidate(
         slot=110,
         direction="DOWN",
@@ -83,8 +96,33 @@ def test_strict_t110_fallback_is_minimum_share_tier():
         decision=decision(ask=0.77, edge=0.19),
     )
     assert tier.accepted
-    assert tier.name == "t110_fallback"
+    assert tier.name == "t110_strong"
     assert tier.minimum_shares
+
+
+def test_market_aligned_t110_recovers_volume():
+    tier = classify_candidate(
+        slot=110,
+        direction="UP",
+        quant_p=0.96,
+        jev_p=0.56,
+        decision=decision(ask=0.84, edge=0.12),
+    )
+    assert tier.accepted
+    assert tier.name == "t110_market_aligned"
+    assert tier.minimum_shares
+
+
+def test_weak_mid_price_t110_is_rejected():
+    tier = classify_candidate(
+        slot=110,
+        direction="UP",
+        quant_p=0.97,
+        jev_p=0.62,
+        decision=decision(ask=0.52, edge=0.45),
+    )
+    assert not tier.accepted
+    assert tier.reason == "t110_quality_gate_failed"
 
 
 def test_t100_never_enters_candidate_tiers():
