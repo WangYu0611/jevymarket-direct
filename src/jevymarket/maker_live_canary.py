@@ -211,7 +211,9 @@ async def account_preflight(client: AsyncSecureClient) -> dict:
         result["balance_usd"] /= 1e6
     page = await client.list_open_orders().first_page()
     result["open_orders_present"] = bool(page.items)
-    approvals = await client.get_trading_approvals_state(wallet=client.wallet)
+    # Omit wallet for the same reason as positions: the authenticated client
+    # owns the canonical account-wallet mapping for EOA/proxy/Deposit Wallet.
+    approvals = await client.get_trading_approvals_state()
     result["trading_approved"] = bool(approvals.is_fully_approved)
     return result
 
