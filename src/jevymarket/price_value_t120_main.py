@@ -36,7 +36,7 @@ from .fast_strategy import fast_settings, local_snapshot, next_deadline, snapsho
 from .jev import JevClient
 from .market_data import watch_chainlink_anchors
 from .network import ReadUnavailable
-from .price_value_early_forward import EarlyRunner, EarlyStore, print_rejections
+from .price_value_early_forward import EarlyRunner, EarlyStore
 from .price_value_forward import (
     ARMS,
     CRYPTO_TAKER_FEE_RATE,
@@ -173,7 +173,12 @@ class V82Store(EarlyStore):
             query += " AND t.slot=?"
             args.append(slot)
         query += " ORDER BY t.decision_ts,t.id"
-        return [dict(r) for r in self.conn.execute(query, args).fetchall()]
+        out = []
+        for row in self.conn.execute(query, args).fetchall():
+            item = dict(row)
+            item["checkpoint"] = item["slot"]
+            out.append(item)
+        return out
 
 
 def strategy_slot(seconds_left: int | None) -> int | None:
@@ -337,6 +342,37 @@ def print_shadow(console: Console, report: dict) -> None:
             _pct(m["net_roi_estimated"]),
         )
     console.print(table)
+
+
+def print_rejections(console: Console, report: dict) -> None:
+    table = Table(title="V8.2 累计过滤原因", header_style="bold white")
+    table.add_column("组别")
+    table.add_column("评估")
+    table.add_column("通过事件")
+    table.add_column("主要拒绝原因")
+    for arm in ARMS:
+        r = report["rejection_summary"][arm]
+        reasons = " | ".join(
+            f"{name}={count}"
+            for name, count in list(r["top_rejections"].items())[:4]
+        ) or "—"
+        table.add_row(
+            arm, str(r["evaluations"]), str(r["accepted_events"]), reasons
+        )
+    console.print(table)
+    statuses = report["coverage"].get("jev_status_counts", {})
+    important = [
+        f"{name}={statuses.get(name, 0)}"
+        for name in (
+            "ok", "busy", "error", "expired", "disabled_auth", "interrupted"
+        )
+        if statuses.get(name, 0)
+    ]
+    console.print(
+        "[dim]Jev状态："
+        + (" | ".join(important) if important else "尚无请求")
+        + "[/]"
+    )
 
 
 class V82Runner(EarlyRunner):
