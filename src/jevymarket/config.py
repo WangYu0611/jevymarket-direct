@@ -16,6 +16,11 @@ class Settings(BaseSettings):
     # Optional: the Polymarket proxy / deposit wallet address if you trade via the
     # website's wallet rather than the raw EOA. Leave empty to let the SDK resolve it.
     polymarket_wallet: str | None = None
+    # Optional Builder credentials for gasless Deposit Wallet / relayer flows.
+    # Keep these only in .env; never commit or print them.
+    polymarket_builder_api_key: str = ""
+    polymarket_builder_secret: str = ""
+    polymarket_builder_passphrase: str = ""
 
     # --- Jev (TypeSafe official API) --------------------------------------
     jev_model: str = "jev-latest"
