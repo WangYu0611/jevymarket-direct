@@ -316,7 +316,13 @@ def test_check_only_still_never_places_order(tmp_path, monkeypatch):
     monkeypatch.setattr(
         live,
         "load_settings",
-        lambda: SimpleNamespace(polymarket_private_key="x", polymarket_wallet=None),
+        lambda: SimpleNamespace(
+            polymarket_private_key="x",
+            polymarket_wallet=None,
+            polymarket_builder_api_key="",
+            polymarket_builder_secret="",
+            polymarket_builder_passphrase="",
+        ),
     )
 
     class Secure:
