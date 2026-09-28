@@ -1,4 +1,3 @@
-import gzip
 import json
 from types import SimpleNamespace
 
