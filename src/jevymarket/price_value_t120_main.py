@@ -542,6 +542,7 @@ def experiment_parameters(settings, interval: float, fee_rate: float) -> dict:
         "timeframe": "5m",
         "primary_strategy": {
             "slot": PRIMARY_SLOT,
+            "prefetch_start_seconds": PRIMARY_PREFETCH_SECONDS,
             "arm": PRIMARY_ARM,
             "rule": "Quant>=92% + Jev quality/direction + refreshed Quant + latest ASK value rules",
         },
