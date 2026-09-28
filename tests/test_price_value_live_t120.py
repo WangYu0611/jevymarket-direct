@@ -456,5 +456,5 @@ def test_live_event_log_persists_pre_submit_reason(tmp_path):
 def test_live_constants_match_user_requested_caps():
     assert live.LIVE_SLOT == 120
     assert live.MAX_ORDER_USD == 5.0
-    assert live.MAX_SESSION_ORDERS == 24
-    assert live.MAX_SESSION_NOTIONAL_USD == 120.0
+    assert live.MAX_SESSION_ORDERS == 5
+    assert live.MAX_SESSION_NOTIONAL_USD == 25.0
