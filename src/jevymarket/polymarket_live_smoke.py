@@ -15,7 +15,7 @@ import argparse
 import asyncio
 import json
 from dataclasses import asdict, dataclass
-from decimal import Decimal, ROUND_CEILING
+from decimal import ROUND_CEILING, Decimal
 
 from polymarket import AsyncPublicClient, AsyncSecureClient
 from polymarket.models.clob.order_response import AcceptedOrder
