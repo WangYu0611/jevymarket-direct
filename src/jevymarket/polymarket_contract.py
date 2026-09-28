@@ -10,7 +10,8 @@ import inspect
 from importlib.metadata import PackageNotFoundError, version
 
 from polymarket import AsyncPublicClient, AsyncSecureClient
-from polymarket.streams import UserSpec
+from polymarket.auth import BuilderApiKey
+from polymarket.streams import CryptoPricesChainlinkTwapSpec, CryptoPricesSpec, UserSpec
 
 AUDITED_POLYMARKET_CLIENT_VERSION = "0.11.0"
 
@@ -39,7 +40,8 @@ def live_sdk_contract() -> dict:
             f"polymarket-client:expected={AUDITED_POLYMARKET_CLIENT_VERSION},installed={installed}"
         )
 
-    # Auth/client lifecycle.
+    # Auth/client lifecycle and builder credentials.
+    _require_params("BuilderApiKey", BuilderApiKey, {"key", "secret", "passphrase"}, failures)
     _require_params(
         "AsyncSecureClient.create",
         AsyncSecureClient.create,
@@ -72,6 +74,24 @@ def live_sdk_contract() -> dict:
         {"wallet"},
         failures,
     )
+    _require_params(
+        "setup_trading_approvals",
+        AsyncSecureClient.setup_trading_approvals,
+        set(),
+        failures,
+    )
+    _require_params(
+        "create_builder_api_key",
+        AsyncSecureClient.create_builder_api_key,
+        set(),
+        failures,
+    )
+    _require_params(
+        "revoke_builder_api_key",
+        AsyncSecureClient.revoke_builder_api_key,
+        set(),
+        failures,
+    )
 
     # Authenticated user stream and order lifecycle.
     _require_params("UserSpec", UserSpec, {"markets"}, failures)
@@ -96,12 +116,25 @@ def live_sdk_contract() -> dict:
         failures,
     )
 
-    # Public market refresh used before and after Jev.
+    # Public market refresh and exact reference-price streams used by V8.2.
     _require_params("get_market", AsyncPublicClient.get_market, {"slug"}, failures)
     _require_params(
         "get_order_books",
         AsyncPublicClient.get_order_books,
         {"asset_ids"},
+        failures,
+    )
+    _require_params("public.subscribe", AsyncPublicClient.subscribe, {"specs"}, failures)
+    _require_params(
+        "CryptoPricesSpec",
+        CryptoPricesSpec,
+        {"topic", "symbols"},
+        failures,
+    )
+    _require_params(
+        "CryptoPricesChainlinkTwapSpec",
+        CryptoPricesChainlinkTwapSpec,
+        {"window_seconds", "symbols"},
         failures,
     )
 
@@ -111,7 +144,10 @@ def live_sdk_contract() -> dict:
         "ok": not failures,
         "failures": failures,
         "audited_calls": [
+            "BuilderApiKey(key, secret, passphrase)",
             "AsyncSecureClient.create",
+            "create_builder_api_key / revoke_builder_api_key",
+            "setup_trading_approvals",
             "get_balance_allowance",
             "list_positions(condition_id=...)",
             "list_open_orders(market=...)",
@@ -124,6 +160,7 @@ def live_sdk_contract() -> dict:
             "list_account_trades(market=...)",
             "AsyncPublicClient.get_market(slug=...)",
             "AsyncPublicClient.get_order_books(asset_ids=[...])",
+            "AsyncPublicClient.subscribe(CryptoPricesSpec / CryptoPricesChainlinkTwapSpec)",
         ],
     }
 
