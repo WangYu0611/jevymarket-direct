@@ -863,7 +863,7 @@ def main(argv=None):
         json.dump(result, handle, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
     print(json.dumps({
         k: result.get(k)
-        for k in ("format", "termination", "geoblock", "preflight", "paper_gate")
+        for k in ("format", "termination", "sdk_contract", "geoblock", "preflight", "paper_gate")
     }, ensure_ascii=False, indent=2))
     print(f"已导出 → {out.resolve()}", flush=True)
 
