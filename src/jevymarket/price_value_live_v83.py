@@ -16,6 +16,8 @@ from pathlib import Path
 from . import price_value_live_t120 as v82live
 from .run_paths import run_output_path
 from .v83_candidate_filter import (
+    T110_ALIGNED_ASK_MIN,
+    T110_ALIGNED_MIN_JEV,
     T110_MIN_EDGE,
     T110_MIN_JEV,
     T110_MIN_QUANT,
@@ -48,7 +50,7 @@ def strategy_manifest() -> dict:
         "revision": REVISION,
         "live_slots": [120, 110],
         "t120_strong_jev_min": T120_STRONG_JEV,
-        "t120_extreme": {
+        "t120_price_regime": {
             "jev_min": T120_EXTREME_MIN_JEV,
             "quant_min": T120_EXTREME_MIN_QUANT,
             "low_ask_max": T120_LOW_ASK_MAX,
@@ -58,7 +60,9 @@ def strategy_manifest() -> dict:
             "sizing": "minimum exchange shares",
         },
         "t110_fallback": {
-            "jev_min": T110_MIN_JEV,
+            "strong_jev_min": T110_MIN_JEV,
+            "market_aligned_jev_min": T110_ALIGNED_MIN_JEV,
+            "market_aligned_ask_min": T110_ALIGNED_ASK_MIN,
             "quant_min": T110_MIN_QUANT,
             "edge_min": T110_MIN_EDGE,
             "sizing": "minimum exchange shares",
@@ -172,7 +176,7 @@ async def async_main(args) -> dict:
 def main(argv=None):
     parser = argparse.ArgumentParser(
         description=(
-            "V8.3 分层策略：T-120强Jev/极端市场 + T-110严格回补；"
+            "V8.3 分层策略：T-120强Jev/价格区间 + T-110严格回补；"
             "复用官方SDK的FAK真钱执行链"
         )
     )
