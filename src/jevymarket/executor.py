@@ -185,22 +185,65 @@ class Executor:
             self._exposure.condition_ids.add(c.condition_id)
 
     async def setup_approvals(self, attempts: int = 6) -> str:
-        """Approve exchange contracts. The public Polygon RPC intermittently answers
-        'Unknown block' mid-batch; already-approved items are skipped, so just retry."""
+        """Approve exchange contracts, including gasless Deposit Wallets.
+
+        EOA wallets can submit approvals directly. Gasless wallets require an
+        SDK api_key for relayed transactions. To avoid asking the operator to
+        copy/store another long-lived secret, create a temporary Builder API
+        key with the already-authenticated account, use it only for the approval
+        transaction, then revoke it immediately.
+        """
         assert isinstance(self.client, AsyncSecureClient)
         from polymarket import RequestRejectedError
 
-        last: Exception | None = None
-        for i in range(1, attempts + 1):
-            try:
-                handle = await self.client.setup_trading_approvals()
-                await handle.wait()
-                state = await self.client.get_trading_approvals_state(wallet=self.wallet)
-                if state.is_fully_approved:
-                    return "fully approved"
-                last = RuntimeError(f"still missing {len(state.missing.erc20)} erc20 / {len(state.missing.erc1155)} erc1155")
-            except RequestRejectedError as e:
-                last = e
-            log.warning("approvals attempt %d/%d: %s", i, attempts, last)
-            await asyncio.sleep(2 * i)
-        raise RuntimeError(f"approvals incomplete after {attempts} attempts: {last}")
+        approval_client = self.client
+        ephemeral_client: AsyncSecureClient | None = None
+
+        if str(self.client.wallet_type) != "EOA":
+            log.info(
+                "Gasless 钱包 %s：创建临时 Builder API Key，仅用于 trading approvals；完成后立即撤销",
+                self.client.wallet_type,
+            )
+            builder_key = await self.client.create_builder_api_key()
+            ephemeral_client = await AsyncSecureClient.create(
+                private_key=self.s.polymarket_private_key,
+                wallet=self.wallet,
+                api_key=builder_key,
+            )
+            if str(ephemeral_client.wallet).lower() != str(self.wallet).lower():
+                await ephemeral_client.close()
+                raise RuntimeError("temporary builder client resolved a different wallet")
+            approval_client = ephemeral_client
+
+        try:
+            last: Exception | None = None
+            for i in range(1, attempts + 1):
+                try:
+                    handle = await approval_client.setup_trading_approvals()
+                    await handle.wait()
+                    state = await approval_client.get_trading_approvals_state(
+                        wallet=approval_client.wallet
+                    )
+                    if state.is_fully_approved:
+                        return "fully approved"
+                    last = RuntimeError(
+                        "still missing "
+                        f"{len(state.missing.erc20)} erc20 / "
+                        f"{len(state.missing.erc1155)} erc1155"
+                    )
+                except RequestRejectedError as e:
+                    last = e
+                log.warning("approvals attempt %d/%d: %s", i, attempts, last)
+                await asyncio.sleep(2 * i)
+            raise RuntimeError(f"approvals incomplete after {attempts} attempts: {last}")
+        finally:
+            if ephemeral_client is not None:
+                try:
+                    await ephemeral_client.revoke_builder_api_key()
+                    log.info("临时 Builder API Key 已撤销")
+                except Exception as exc:  # noqa: BLE001
+                    log.warning(
+                        "临时 Builder API Key 自动撤销失败：%s；请在 Polymarket Builder keys 中检查",
+                        type(exc).__name__,
+                    )
+                await ephemeral_client.close()
