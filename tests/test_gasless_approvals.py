@@ -71,6 +71,9 @@ def settings():
     return SimpleNamespace(
         polymarket_private_key="0x" + "1" * 64,
         polymarket_wallet=None,
+        polymarket_builder_api_key="",
+        polymarket_builder_secret="",
+        polymarket_builder_passphrase="",
     )
 
 
@@ -132,3 +135,44 @@ async def test_gasless_temp_client_wallet_mismatch_fails_closed(monkeypatch):
 
     with pytest.raises(RuntimeError, match="different wallet"):
         await ex.setup_approvals(attempts=1)
+
+
+def manual_settings():
+    return SimpleNamespace(
+        polymarket_private_key="0x" + "1" * 64,
+        polymarket_wallet="0xdeposit",
+        polymarket_builder_api_key="builder-key",
+        polymarket_builder_secret="builder-secret",
+        polymarket_builder_passphrase="builder-passphrase",
+    )
+
+
+def test_builder_api_key_from_settings_requires_all_three_fields():
+    s = manual_settings()
+    key = executor.builder_api_key_from_settings(s)
+    assert key.key == "builder-key"
+    assert key.secret == "builder-secret"
+    assert key.passphrase == "builder-passphrase"
+
+    broken = manual_settings()
+    broken.polymarket_builder_secret = ""
+    with pytest.raises(ValueError, match="Builder凭据不完整"):
+        executor.builder_api_key_from_settings(broken)
+
+
+@pytest.mark.asyncio
+async def test_manual_builder_key_uses_existing_gasless_client_without_ephemeral(monkeypatch):
+    monkeypatch.setattr(executor, "AsyncSecureClient", FakeSecureClient)
+    original = FakeSecureClient(wallet_type="DEPOSIT_WALLET", wallet="0xdeposit")
+
+    async def must_not_create_key():
+        raise AssertionError("manual Builder key must not create an ephemeral key")
+
+    original.create_builder_api_key = must_not_create_key
+    ex = executor.Executor(original, "0xdeposit", manual_settings(), SimpleNamespace(), False)
+
+    result = await ex.setup_approvals(attempts=1)
+
+    assert result == "fully approved"
+    assert original.setup_calls == 1
+    assert FakeSecureClient.create_calls == []
