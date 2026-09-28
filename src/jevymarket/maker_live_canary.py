@@ -405,7 +405,7 @@ async def run_live(seconds: int, db: Path, report: dict, client: AsyncSecureClie
                 report["candidate_seen"] = asdict(candidate)
                 try:
                     positions = await client.list_positions(
-                        user=str(client.wallet), market=[candidate.condition], status="OPEN"
+                        user=str(client.wallet), condition_id=candidate.condition, status="OPEN"
                     ).first_page()
                 except Exception as exc:
                     report["termination"] = "market_position_check_failed"
