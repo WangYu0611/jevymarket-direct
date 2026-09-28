@@ -298,24 +298,26 @@ class LiveT120Runner(V82Runner):
             balance = await self.secure_client.get_balance_allowance(asset_type="COLLATERAL")
             raw = float(balance.balance)
             balance_usd = raw / 1e6
-        except Exception:
-            return False, "balance_check_failed"
+        except Exception as exc:
+            return False, "balance_check_failed:" + safe_error(exc)["classes"][0]
         if balance_usd + 1e-9 < MAX_ORDER_USD:
             return False, "insufficient_collateral"
 
         try:
             positions = await self.secure_client.list_positions(
-                user=str(self.secure_client.wallet), market=[condition_id], status="OPEN"
+                user=str(self.secure_client.wallet),
+                condition_id=condition_id,
+                status="OPEN",
             ).first_page()
-        except Exception:
-            return False, "position_check_failed"
+        except Exception as exc:
+            return False, "position_check_failed:" + safe_error(exc)["classes"][0]
         if positions.items:
             return False, "existing_market_position"
 
         try:
             open_orders = await self.secure_client.list_open_orders(market=condition_id).first_page()
-        except Exception:
-            return False, "open_order_check_failed"
+        except Exception as exc:
+            return False, "open_order_check_failed:" + safe_error(exc)["classes"][0]
         if open_orders.items:
             return False, "existing_market_open_order"
         return True, "ok"
