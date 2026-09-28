@@ -67,6 +67,14 @@ def minimum_share_decision(
     decision: ValueDecision, *, hard_cap_usd: float = 5.0,
     fee_rate: float = CRYPTO_TAKER_FEE_RATE,
 ) -> ValueDecision:
+    values = (decision.min_order_size, decision.ask, hard_cap_usd, fee_rate)
+    if not all(math.isfinite(value) for value in values):
+        raise ValueError("invalid_minimum_share_inputs")
+    if decision.min_order_size <= 0 or not 0 < decision.ask < 1:
+        raise ValueError("invalid_minimum_share_inputs")
+    if hard_cap_usd <= 0 or fee_rate < 0:
+        raise ValueError("invalid_minimum_share_inputs")
+
     size = math.ceil((decision.min_order_size - 1e-12) * 100) / 100
     notional = round(size * decision.ask, 6)
     if size <= 0 or notional <= 0 or notional > hard_cap_usd + 1e-9:
