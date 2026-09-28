@@ -19,9 +19,10 @@ from .price_value_forward import (
     ValueDecision,
     arm_metrics,
     quant_direction,
-    value_decision as original_value_decision,
 )
-from .price_value_t120_main import V82Runner, build_report as build_paper_report
+from .price_value_forward import value_decision as original_value_decision
+from .price_value_t120_main import V82Runner
+from .price_value_t120_main import build_report as build_paper_report
 from .signal import quantitative_up_probability
 from .v83_candidate_filter import (
     CandidateTier,
