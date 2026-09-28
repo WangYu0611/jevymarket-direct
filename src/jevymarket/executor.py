@@ -211,7 +211,10 @@ class Executor:
                 api_key=builder_key,
             )
             if str(ephemeral_client.wallet).lower() != str(self.wallet).lower():
-                await ephemeral_client.close()
+                try:
+                    await ephemeral_client.revoke_builder_api_key()
+                finally:
+                    await ephemeral_client.close()
                 raise RuntimeError("temporary builder client resolved a different wallet")
             approval_client = ephemeral_client
 
