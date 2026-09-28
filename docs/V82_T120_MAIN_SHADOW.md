@@ -1,6 +1,6 @@
 # V8.2 — T-120 Primary, T-100/C Shadow Research
 
-V8.2 is the post-V8.1 mainline.
+V8.2 is the post-V8.1 mainline. R2 adds a T-130..T-120 warm-up read so first-access market metadata latency cannot silently consume the real T-120 sampling window.
 
 The strategy decision has been narrowed to one primary rule:
 
@@ -16,6 +16,21 @@ T-120
 
 Only this rule can pass the V8.2 profitability gate or reach a future live
 placement hook.
+
+## T-120 timing guard
+
+The live/paper loop still runs at a fixed 10-second cadence, but the first access to a new 5-minute market can be slower because market metadata must be fetched before the order book.
+
+R2 therefore opens a read one cadence early:
+
+```text
+T-130..T-121: warm metadata/book only
+T-120..T-111: real primary observation
+T-110: retired (no strategy observation)
+T-100..T-91: shadow observation
+```
+
+The warm-up read is never itself treated as a T-120 trade unless the read completes inside the real T-120 window. This changes collection robustness, not the T-120 strategy criteria.
 
 ## Primary strategy
 
