@@ -39,6 +39,7 @@ from .maker_live_canary import (
     safe_response,
 )
 from .market_data import watch_chainlink_anchors
+from .polymarket_contract import live_sdk_contract
 from .price_value_forward import (
     CRYPTO_TAKER_FEE_RATE,
     ValueDecision,
@@ -65,7 +66,7 @@ from .price_value_t120_main import (
 from .run_paths import run_output_path
 from .signal import JevView, quantitative_up_probability
 
-REVISION = "v8.2-t120-live-r3"
+REVISION = "v8.2-t120-live-r4"
 CONFIRM_ONE = "ONE_REAL_T120_QUANT_JEV_ASK"
 CONFIRM_SESSION = "LIVE_T120_QUANT_JEV_ASK_SESSION"
 LIVE_SLOT = 120
