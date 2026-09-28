@@ -38,8 +38,8 @@ The FAK order may fill partially and cancel the remainder automatically.
 
 For a future full live session, hard upper bounds are:
 
-- 24 real attempts;
-- USD 120 cumulative planned notional;
+- 5 real attempts;
+- USD 25 cumulative planned notional;
 - USD 5 maximum spend per order.
 
 ## Paper gates
