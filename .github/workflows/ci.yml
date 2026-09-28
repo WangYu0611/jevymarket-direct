@@ -23,6 +23,9 @@ jobs:
           enable-cache: true
       - name: Sync
         run: uv sync --all-groups --python ${{ matrix.python-version }}
+      - name: Show lock diff
+        if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.12'
+        run: git diff -- uv.lock
       - name: Lint
         run: uv run ruff check .
       - name: Test
