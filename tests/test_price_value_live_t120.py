@@ -254,7 +254,7 @@ def test_only_t120_b_hook_can_reach_live_path():
 
 
 
-def test_pre_submit_position_check_uses_condition_id(monkeypatch):
+def test_pre_submit_position_check_uses_authenticated_wallet_and_condition_id(monkeypatch):
     calls = []
 
     async def geo():
@@ -280,6 +280,7 @@ def test_pre_submit_position_check_uses_condition_id(monkeypatch):
         def list_positions(self, **kwargs):
             calls.append(("positions", kwargs))
             assert "market" not in kwargs
+            assert "user" not in kwargs
             assert kwargs["condition_id"] == "condition-123"
             assert kwargs["status"] == "OPEN"
             return Pager()

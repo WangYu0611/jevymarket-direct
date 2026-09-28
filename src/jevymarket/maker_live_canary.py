@@ -211,7 +211,9 @@ async def account_preflight(client: AsyncSecureClient) -> dict:
         result["balance_usd"] /= 1e6
     page = await client.list_open_orders().first_page()
     result["open_orders_present"] = bool(page.items)
-    approvals = await client.get_trading_approvals_state(wallet=client.wallet)
+    # Omit wallet for the same reason as positions: the authenticated client
+    # owns the canonical account-wallet mapping for EOA/proxy/Deposit Wallet.
+    approvals = await client.get_trading_approvals_state()
     result["trading_approved"] = bool(approvals.is_fully_approved)
     return result
 
@@ -405,8 +407,11 @@ async def run_live(seconds: int, db: Path, report: dict, client: AsyncSecureClie
             else:
                 report["candidate_seen"] = asdict(candidate)
                 try:
+                    # Let the authenticated client select its canonical account
+                    # wallet. This is required for Deposit Wallet/proxy accounts,
+                    # where the signer and trading wallet are intentionally distinct.
                     positions = await client.list_positions(
-                        user=str(client.wallet), condition_id=candidate.condition, status="OPEN"
+                        condition_id=candidate.condition, status="OPEN"
                     ).first_page()
                 except Exception as exc:
                     report["termination"] = "market_position_check_failed"
