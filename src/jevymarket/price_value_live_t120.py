@@ -25,6 +25,7 @@ from rich.console import Console
 from rich.panel import Panel
 
 from .config import load_settings
+from .executor import builder_api_key_from_settings
 from .fast_cli import single_instance
 from .fast_runner import settlement_worker
 from .fast_strategy import fast_settings, local_snapshot, next_deadline
@@ -665,6 +666,7 @@ async def async_main(args) -> dict:
         secure = await AsyncSecureClient.create(
             private_key=raw.polymarket_private_key,
             wallet=raw.polymarket_wallet or None,
+            api_key=builder_api_key_from_settings(raw),
         )
     except Exception as exc:
         return {"format": REVISION, "termination": "client_create_failed", "error": safe_error(exc), "geoblock": geo, "paper_gate": gate}
