@@ -6,7 +6,7 @@ import asyncio
 import logging
 from dataclasses import dataclass, field
 
-from polymarket import AsyncPublicClient, AsyncSecureClient
+from polymarket import AsyncPublicClient, AsyncSecureClient, BuilderApiKey
 from polymarket.models.clob.order_response import AcceptedOrder, RejectedOrder
 
 from .config import Settings
@@ -42,6 +42,22 @@ def _has_key(s: Settings) -> bool:
     return len(k.removeprefix("0x")) == 64
 
 
+def builder_api_key_from_settings(s: Settings) -> BuilderApiKey | None:
+    values = (
+        (s.polymarket_builder_api_key or "").strip(),
+        (s.polymarket_builder_secret or "").strip(),
+        (s.polymarket_builder_passphrase or "").strip(),
+    )
+    if not any(values):
+        return None
+    if not all(values):
+        raise ValueError(
+            "Builder凭据不完整：POLYMARKET_BUILDER_API_KEY / "
+            "POLYMARKET_BUILDER_SECRET / POLYMARKET_BUILDER_PASSPHRASE 必须同时配置"
+        )
+    return BuilderApiKey(key=values[0], secret=values[1], passphrase=values[2])
+
+
 class Executor:
     """Wraps either an authenticated client (can trade) or, for --dry-run without a key,
     a public client that only reads positions for the configured wallet address."""
@@ -70,6 +86,7 @@ class Executor:
             client = await AsyncSecureClient.create(
                 private_key=settings.polymarket_private_key,
                 wallet=settings.polymarket_wallet or None,
+                api_key=builder_api_key_from_settings(settings),
             )
             log.info("钱包 %s（%s），模拟模式=%s", client.wallet, client.wallet_type, dry_run)
             return cls(client, str(client.wallet), settings, store, dry_run)
@@ -199,9 +216,9 @@ class Executor:
         approval_client = self.client
         ephemeral_client: AsyncSecureClient | None = None
 
-        if str(self.client.wallet_type) != "EOA":
+        if str(self.client.wallet_type) != "EOA" and builder_api_key_from_settings(self.s) is None:
             log.info(
-                "Gasless 钱包 %s：创建临时 Builder API Key，仅用于 trading approvals；完成后立即撤销",
+                "Gasless 钱包 %s：未配置手工 Builder Key，创建临时 Builder API Key；完成后立即撤销",
                 self.client.wallet_type,
             )
             builder_key = await self.client.create_builder_api_key()
