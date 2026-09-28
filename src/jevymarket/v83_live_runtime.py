@@ -7,7 +7,6 @@ and report metadata.
 from __future__ import annotations
 
 import asyncio
-import json
 import time
 from contextvars import ContextVar
 
